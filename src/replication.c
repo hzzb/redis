@@ -366,12 +366,14 @@ void replicationFeedSlavesFromMasterStream(list *slaves, char *buf, size_t bufle
         printf("\n");
     }
 
+    // step 1: 保存到server.repl_backlog中
     if (server.repl_backlog) feedReplicationBacklog(buf,buflen);
     listRewind(slaves,&li);
     while((ln = listNext(&li))) {
         client *slave = ln->value;
 
         if (!canFeedReplicaReplBuffer(slave)) continue;
+        // step 2: 写给sub slave
         addReplyProto(slave,buf,buflen);
     }
 }
@@ -716,9 +718,12 @@ int startBgsaveForReplication(int mincapa) {
 
 /* SYNC and PSYNC command implementation. */
 void syncCommand(client *c) {
+
+    // step 1: 已经发过psync成为了slave, 无需再处理
     /* ignore SYNC if already slave or in monitor mode */
     if (c->flags & CLIENT_SLAVE) return;
 
+    // step 2: psync host port failover 的场景
     /* Check if this is a failover request to a replica with the same replid and
      * become a master if so. */
     if (c->argc > 3 && !strcasecmp(c->argv[0]->ptr,"psync") && 
@@ -743,12 +748,14 @@ void syncCommand(client *c) {
         }
     }
 
+    // step 3: ?
     /* Don't let replicas sync with us while we're failing over */
     if (server.failover_state != NO_FAILOVER) {
         addReplyError(c,"-NOMASTERLINK Can't SYNC while failing over");
         return;
     }
 
+    // step 4: 本实例是slave，且与master已失联。拒绝sub-slave的请求
     /* Refuse SYNC requests if we are a slave but the link with our master
      * is not ok... */
     if (server.masterhost && server.repl_state != REPL_STATE_CONNECTED) {
@@ -756,6 +763,7 @@ void syncCommand(client *c) {
         return;
     }
 
+    // step 5: sync需要一个干净的reply buffer
     /* SYNC can't be issued when the server has pending data to send to
      * the client about already issued commands. We need a fresh reply
      * buffer registering the differences between the BGSAVE and the current
@@ -778,6 +786,7 @@ void syncCommand(client *c) {
      * So the slave knows the new replid and offset to try a PSYNC later
      * if the connection with the master is lost. */
     if (!strcasecmp(c->argv[0]->ptr,"psync")) {
+        // step 6.1: client 主张尝试部分同步
         if (masterTryPartialResynchronization(c) == C_OK) {
             server.stat_sync_partial_ok++;
             return; /* No full resync needed, return. */
@@ -791,6 +800,8 @@ void syncCommand(client *c) {
             if (master_replid[0] != '?') server.stat_sync_partial_err++;
         }
     } else {
+        // step 6.2: client 主张全同步。则client 不同定期回复 replconf ack
+
         /* If a slave uses SYNC, we are dealing with an old implementation
          * of the replication protocol (like redis-cli --slave). Flag the client
          * so that we don't expect to receive REPLCONF ACK feedbacks. */

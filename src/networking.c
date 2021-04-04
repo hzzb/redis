@@ -1808,6 +1808,9 @@ int processMultibulkBuffer(client *c) {
     int ok;
     long long ll;
 
+    // step 1: 解出数组长度
+    // 从c->querybuf的c->qb_pos位置开始解析 *multibulklen\r\n 的结构
+    // 解析成功后再把c->qb_pos做相应后移
     if (c->multibulklen == 0) {
         /* The client should have been reset */
         serverAssertWithInfo(c,NULL,c->argc == 0);
@@ -1836,6 +1839,8 @@ int processMultibulkBuffer(client *c) {
             return C_ERR;
         }
 
+        // c->qb_pos指向\n的下一个位置
+        // [c->querybuf, newline]， newline是\r
         c->qb_pos = (newline-c->querybuf)+2;
 
         if (ll <= 0) return C_OK;
@@ -1848,8 +1853,11 @@ int processMultibulkBuffer(client *c) {
         c->argv_len_sum = 0;
     }
 
+
+    // step 2: 读出每个数组元素
     serverAssertWithInfo(c,NULL,c->multibulklen > 0);
     while(c->multibulklen) {
+        // step 2.1: 读出一个元素的长度
         /* Read bulk length if unknown */
         if (c->bulklen == -1) {
             newline = strchr(c->querybuf+c->qb_pos,'\r');
@@ -1905,6 +1913,7 @@ int processMultibulkBuffer(client *c) {
             c->bulklen = ll;
         }
 
+        // step 2.2: 读出元素的完整内容，并创建c->argv数组对应的元素
         /* Read bulk argument */
         if (sdslen(c->querybuf)-c->qb_pos < (size_t)(c->bulklen+2)) {
             /* Not enough data (+2 == trailing \r\n) */
@@ -1930,10 +1939,15 @@ int processMultibulkBuffer(client *c) {
                 c->argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen+2;
             }
+            
+            // step 2.3: 为读下一个元素做准备
             c->bulklen = -1;
             c->multibulklen--;
         }
     }
+
+    // step 3: 一条完整的命令是否读到
+    // C_OK 或者 C_ERR
 
     /* We're done when c->multibulk == 0 */
     if (c->multibulklen == 0) return C_OK;
@@ -1951,6 +1965,10 @@ void commandProcessed(client *c) {
     long long prev_offset = c->reploff;
     if (c->flags & CLIENT_MASTER && !(c->flags & CLIENT_MULTI)) {
         /* Update the applied replication offset of our master. */
+
+        // 从master读到的总字节数 - c->querybuf中剩余未被处理的字节数 = 本实例复制master时已生效的偏移量
+        // c->read_reploff: 从master读到的总字节数
+        // c->reploff:      从master读到已应用到本实例的总字节数
         c->reploff = c->read_reploff - sdslen(c->querybuf) + c->qb_pos;
     }
 
@@ -1971,6 +1989,7 @@ void commandProcessed(client *c) {
      * part of the replication stream, will be propagated to the
      * sub-replicas and to the replication backlog. */
     if (c->flags & CLIENT_MASTER) {
+        // 来自master的命令，有多少应用在了本实例上，就复制多少给sub-slave.
         long long applied = c->reploff - prev_offset;
         if (applied) {
             replicationFeedSlavesFromMasterStream(server.slaves,
@@ -2021,6 +2040,8 @@ int processPendingCommandsAndResetClient(client *c) {
  * or because a client was blocked and later reactivated, so there could be
  * pending query buffer, already representing a full command, to process. */
 void processInputBuffer(client *c) {
+
+    // c->querybuf保存 IO层回调(readQueryFromClient)从链接上读的数据。
     /* Keep processing while there is something in the input buffer */
     while(c->qb_pos < sdslen(c->querybuf)) {
         /* Immediately abort if the client is in the middle of something. */
@@ -2043,6 +2064,7 @@ void processInputBuffer(client *c) {
          * The same applies for clients we want to terminate ASAP. */
         if (c->flags & (CLIENT_CLOSE_AFTER_REPLY|CLIENT_CLOSE_ASAP)) break;
 
+        // step 1: 解析输入的协议。一般是字符串数组，所以c->qb_pos应该是*
         /* Determine request type when unknown. */
         if (!c->reqtype) {
             if (c->querybuf[c->qb_pos] == '*') {
@@ -2053,6 +2075,7 @@ void processInputBuffer(client *c) {
         }
 
         if (c->reqtype == PROTO_REQ_INLINE) {
+            // 2.1: 非字符串数组形式的输入
             if (processInlineBuffer(c) != C_OK) break;
             /* If the Gopher mode and we got zero or one argument, process
              * the request in Gopher mode. To avoid data race, Redis won't
@@ -2067,6 +2090,8 @@ void processInputBuffer(client *c) {
                 break;
             }
         } else if (c->reqtype == PROTO_REQ_MULTIBULK) {
+            // step 2.2: 数组字符串形式的输入
+            // 没有读到完整数组时，等下次IO回调继续读。
             if (processMultibulkBuffer(c) != C_OK) break;
         } else {
             serverPanic("Unknown request type");
@@ -2074,8 +2099,11 @@ void processInputBuffer(client *c) {
 
         /* Multibulk processing could see a <= 0 length. */
         if (c->argc == 0) {
+            // step 3.1: 命令名+命令参数 个数为0，无作用无影响，准备接受下一个新命令
             resetClient(c);
         } else {
+            // step 3.2: 读到完整数组。但不在主线程时标记延后执行命令
+
             /* If we are in the context of an I/O thread, we can't really
              * execute the command here. All we can do is to flag the client
              * as one that needs to process the command. */
@@ -2084,6 +2112,7 @@ void processInputBuffer(client *c) {
                 break;
             }
 
+            // step 3.3: 执行命令
             /* We are finally ready to execute the command. */
             if (processCommandAndResetClient(c) == C_ERR) {
                 /* If the client is no longer valid, we avoid exiting this
@@ -2094,6 +2123,7 @@ void processInputBuffer(client *c) {
         }
     }
 
+    // step 4: 把c->qb_pos到末尾的数据移动到起始位置，释放出空间c->qb_pos前的空间。
     /* Trim to pos */
     if (c->qb_pos) {
         sdsrange(c->querybuf,c->qb_pos,-1);
@@ -2101,6 +2131,7 @@ void processInputBuffer(client *c) {
     }
 }
 
+// 回调该函数
 void readQueryFromClient(connection *conn) {
     client *c = connGetPrivateData(conn);
     int nread, readlen;
@@ -2147,6 +2178,8 @@ void readQueryFromClient(connection *conn) {
         freeClientAsync(c);
         return;
     } else if (c->flags & CLIENT_MASTER) {
+        // c 是本实例和master实例之间的 链接。
+        // master对本实例的写流量，后面无修改地复制给本实例的slave.
         /* Append the query buffer to the pending (not applied) buffer
          * of the master. We'll use this buffer later in order to have a
          * copy of the string applied by the last command executed. */
@@ -2156,7 +2189,7 @@ void readQueryFromClient(connection *conn) {
 
     sdsIncrLen(c->querybuf,nread);
     c->lastinteraction = server.unixtime;
-    if (c->flags & CLIENT_MASTER) c->read_reploff += nread;
+    if (c->flags & CLIENT_MASTER) c->read_reploff += nread; // 从master读到的字节总数
     atomicIncr(server.stat_net_input_bytes, nread);
     if (sdslen(c->querybuf) > server.client_max_querybuf_len) {
         sds ci = catClientInfoString(sdsempty(),c), bytes = sdsempty();
