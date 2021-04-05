@@ -528,12 +528,15 @@ int masterTryPartialResynchronization(client *c) {
     char buf[128];
     int buflen;
 
+    // step 1: 解析出slave发送过来的偏移psync_offset，失败时fullsync.
     /* Parse the replication offset asked by the slave. Go to full sync
      * on parse error: this should never happen but we try to handle
      * it in a robust way compared to aborting. */
     if (getLongLongFromObjectOrReply(c,c->argv[2],&psync_offset,NULL) !=
        C_OK) goto need_full_resync;
 
+    // step 2: 检查slave发送过来的replid是否满足partial sync的前提。
+    // master_replid与server.replid相同， 或者与sever.replid2相同且psync_offset不大于server.second_replid_offset，则是有效的。
     /* Is the replication ID of this master the same advertised by the wannabe
      * slave via PSYNC? If the replication ID changed this master has a
      * different replication history, and there is no way to continue.
@@ -549,22 +552,26 @@ int masterTryPartialResynchronization(client *c) {
             if (strcasecmp(master_replid, server.replid) &&
                 strcasecmp(master_replid, server.replid2))
             {
+                // step 2.1: 与server.replid/serve.replid2都不匹配
                 serverLog(LL_NOTICE,"Partial resynchronization not accepted: "
                     "Replication ID mismatch (Replica asked for '%s', my "
                     "replication IDs are '%s' and '%s')",
                     master_replid, server.replid, server.replid2);
             } else {
+                // step 2.2: 与server.replid2匹配，但psync_offset大于server_second_replid_offset.
                 serverLog(LL_NOTICE,"Partial resynchronization not accepted: "
                     "Requested offset for second ID was %lld, but I can reply "
                     "up to %lld", psync_offset, server.second_replid_offset);
             }
         } else {
+            // step 2.3: master_replid是 ？则是full sync  
             serverLog(LL_NOTICE,"Full resync requested by replica %s",
                 replicationGetSlaveName(c));
         }
         goto need_full_resync;
     }
 
+    // step 3: psync_offset是否包含在复制积压缓冲区中？
     /* We still have the data our slave is asking for? */
     if (!server.repl_backlog ||
         psync_offset < server.repl_backlog_off ||
@@ -579,6 +586,10 @@ int masterTryPartialResynchronization(client *c) {
         goto need_full_resync;
     }
 
+    // step 4: 可以进行partial sync.
+    // 标记该client 为slave
+    // 回复 +CONTINUE server.replid
+    // 回复server.repl_backlog复制积压缓冲区中的内容
     /* If we reached this point, we are able to perform a partial resync:
      * 1) Set client state to make it a slave.
      * 2) Inform the client we can continue with +CONTINUE
@@ -609,6 +620,7 @@ int masterTryPartialResynchronization(client *c) {
      * to -1 to force the master to emit SELECT, since the slave already
      * has this state from the previous connection with the master. */
 
+    // step 5: server.repl_good_slaves_count的计算
     refreshGoodSlavesCount();
 
     /* Fire the replica change modules event. */
@@ -653,20 +665,25 @@ int startBgsaveForReplication(int mincapa) {
     serverLog(LL_NOTICE,"Starting BGSAVE for SYNC with target: %s",
         socket_target ? "replicas sockets" : "disk");
 
+    
+    // step 1: 启用bgsave的子进程，rdb or socket
     rdbSaveInfo rsi, *rsiptr;
     rsiptr = rdbPopulateSaveInfo(&rsi);
     /* Only do rdbSave* when rsiptr is not NULL,
      * otherwise slave will miss repl-stream-db. */
     if (rsiptr) {
         if (socket_target)
+            // 子进程通过pipe向parent写，parent再通过socket向slave写
             retval = rdbSaveToSlavesSockets(rsiptr);
         else
+            // 子进程写好rdb文件
             retval = rdbSaveBackground(server.rdb_filename,rsiptr);
     } else {
         serverLog(LL_WARNING,"BGSAVE for replication: replication information not available, can't generate the RDB file right now. Try later.");
         retval = C_ERR;
     }
 
+    // step 2: 标记后续删除生成的rdb文件
     /* If we succeeded to start a BGSAVE with disk target, let's remember
      * this fact, so that we can later delete the file if needed. Note
      * that we don't set the flag to 1 if the feature is disabled, otherwise
@@ -675,6 +692,7 @@ int startBgsaveForReplication(int mincapa) {
     if (retval == C_OK && !socket_target && server.rdb_del_sync_files)
         RDBGeneratedByReplication = 1;
 
+    // step 3: 准备子进程时出错了，关闭WAIT_BGSAVE_START状态的slave链接
     /* If we failed to BGSAVE, remove the slaves waiting for a full
      * resynchronization from the list of slaves, inform them with
      * an error about what happened, close the connection ASAP. */
@@ -696,6 +714,7 @@ int startBgsaveForReplication(int mincapa) {
         return retval;
     }
 
+    // step 4: disk rdb的，回复+FULLRESYNC
     /* If the target is socket, rdbSaveToSlavesSockets() already setup
      * the slaves for a full resync. Otherwise for disk target do it now.*/
     if (!socket_target) {
@@ -710,6 +729,7 @@ int startBgsaveForReplication(int mincapa) {
         }
     }
 
+    // step 5: 清空script cache 
     /* Flush the script cache, since we need that slave differences are
      * accumulated without requiring slaves to match our cached scripts. */
     if (retval == C_OK) replicationScriptCacheFlush();
@@ -748,7 +768,7 @@ void syncCommand(client *c) {
         }
     }
 
-    // step 3: ?
+    // step 3: 本实例 正在 failover, 拒绝 sync/psync请求
     /* Don't let replicas sync with us while we're failing over */
     if (server.failover_state != NO_FAILOVER) {
         addReplyError(c,"-NOMASTERLINK Can't SYNC while failing over");
@@ -788,6 +808,7 @@ void syncCommand(client *c) {
     if (!strcasecmp(c->argv[0]->ptr,"psync")) {
         // step 6.1: client 主张尝试部分同步
         if (masterTryPartialResynchronization(c) == C_OK) {
+            // partial resync成功，复制积压缓冲区中的内容已经写到c的reply缓冲区。
             server.stat_sync_partial_ok++;
             return; /* No full resync needed, return. */
         } else {
@@ -808,9 +829,13 @@ void syncCommand(client *c) {
         c->flags |= CLIENT_PRE_PSYNC;
     }
 
+    // step 7: 不满足partial resync, 需要full resync.
+
+    // step 7.1: full resync 计数
     /* Full resynchronization. */
     server.stat_sync_full++;
 
+    // step 7.2: 标记c为slave
     /* Setup the slave as one waiting for BGSAVE to start. The following code
      * paths will change the state if we handle the slave differently. */
     c->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
@@ -820,6 +845,7 @@ void syncCommand(client *c) {
     c->flags |= CLIENT_SLAVE;
     listAddNodeTail(server.slaves,c);
 
+    // step 7.3: 第一个psync命令，准备server.repl_backlog server.replid serve.replid2
     /* Create the replication backlog if needed. */
     if (listLength(server.slaves) == 1 && server.repl_backlog == NULL) {
         /* When we create the backlog from scratch, we always use a new
@@ -833,6 +859,7 @@ void syncCommand(client *c) {
                             server.replid, server.replid2);
     }
 
+    // step 8.1: 之前的psync命令产生的子进程还在进行，本c可以复用其结果。disk
     /* CASE 1: BGSAVE is in progress, with disk target. */
     if (server.child_type == CHILD_TYPE_RDB &&
         server.rdb_child_type == RDB_CHILD_TYPE_DISK)
@@ -844,6 +871,7 @@ void syncCommand(client *c) {
         listNode *ln;
         listIter li;
 
+        // 寻找第一个可以复用其rdb结果的slave
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             slave = ln->value;
@@ -854,6 +882,9 @@ void syncCommand(client *c) {
                  (c->flags & CLIENT_REPL_RDBONLY)))
                 break;
         }
+
+        // 回复 +FULLRESYNC.
+        // 复制slave reply buffer 到 c.  WHY?
         /* To attach this slave, we check that it has at least all the
          * capabilities of the slave that triggered the current BGSAVE. */
         if (ln && ((c->slave_capa & slave->slave_capa) == slave->slave_capa)) {
@@ -869,6 +900,7 @@ void syncCommand(client *c) {
             serverLog(LL_NOTICE,"Can't attach the replica to the current BGSAVE. Waiting for next BGSAVE for SYNC");
         }
 
+    // step 8.2: 之前的psync命令产生的子进程还在进行，本c需要等待下一次bgsave。socket
     /* CASE 2: BGSAVE is in progress, with socket target. */
     } else if (server.child_type == CHILD_TYPE_RDB &&
                server.rdb_child_type == RDB_CHILD_TYPE_SOCKET)
@@ -878,16 +910,19 @@ void syncCommand(client *c) {
          * in order to synchronize. */
         serverLog(LL_NOTICE,"Current BGSAVE has socket target. Waiting for next BGSAVE for SYNC");
 
+    // step 8.3: 没有之前的psync命令在进行
     /* CASE 3: There is no BGSAVE is progress. */
     } else {
         if (server.repl_diskless_sync && (c->slave_capa & SLAVE_CAPA_EOF) &&
             server.repl_diskless_sync_delay)
         {
+            // 延时创建diskless socket类型子进程，便于合并多个psync的链接
             /* Diskless replication RDB child is created inside
              * replicationCron() since we want to delay its start a
              * few seconds to wait for more slaves to arrive. */
             serverLog(LL_NOTICE,"Delay next BGSAVE for diskless SYNC");
         } else {
+            // 不延时，立即创建。
             /* We don't have a BGSAVE in progress, let's start one. Diskless
              * or disk-based mode is determined by replica's capacity. */
             if (!hasActiveChildProcess()) {
@@ -3470,6 +3505,7 @@ void replicationCron(void) {
     replication_cron_loops++; /* Incremented with frequency 1 HZ. */
 }
 
+// 如果必要启动子bgsave进程进行
 void replicationStartPendingFork(void) {
     /* Start a BGSAVE good for replication if we have slaves in
      * WAIT_BGSAVE_START state.
@@ -3477,6 +3513,8 @@ void replicationStartPendingFork(void) {
      * In case of diskless replication, we make sure to wait the specified
      * number of seconds (according to configuration) so that other slaves
      * have the time to arrive before we start streaming. */
+
+    // 已经有子进程，则不创建。新的SLAVE_STATE_WAIT_BGSAVE_START状态的slave需要等到已有子进程结束后再启动新的
     if (!hasActiveChildProcess()) {
         time_t idle, max_idle = 0;
         int slaves_waiting = 0;
@@ -3484,6 +3522,7 @@ void replicationStartPendingFork(void) {
         listNode *ln;
         listIter li;
 
+        // step 1: 计数WAIT_BGSAVE_START状态的slave数量，并记录它们之中已等待的最长时间
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             client *slave = ln->value;
@@ -3496,6 +3535,7 @@ void replicationStartPendingFork(void) {
             }
         }
 
+        // step 2: 有slave等待，rdb文件方式 或者 socket方式且等待了server.repl_diskless_sync_delay配置的时间。则起新子进程。
         if (slaves_waiting &&
             (!server.repl_diskless_sync ||
              max_idle >= server.repl_diskless_sync_delay))
