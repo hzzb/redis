@@ -208,6 +208,13 @@ int canFeedReplicaReplBuffer(client *replica) {
     return 1;
 }
 
+// 把argv代表的数组的命令 追加到server.repl_backlog复制积压缓冲区，同时写到slave的链接上。
+// 注: 只针对最顶级的master和它的直接slave。
+//
+// 考虑 多级联 redis的情况:
+// master -> slave1 -> slave2
+//                \ -> slave3
+// slave1 写给 slave2/slave3 的内容 和 从master到slave1的内容完全一样，见replicationFeedSlavesFromMasterStream函数。
 /* Propagate write commands to slaves, and populate the replication backlog
  * as well. This function is used if the instance is a master: we use
  * the commands received by our clients in order to create the replication
@@ -219,6 +226,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
     int j, len;
     char llstr[LONG_STR_SIZE];
 
+    // step 1 : 如果不是top level master，则是中间slave，无需执行。
     /* If the instance is not a top level master, return ASAP: we'll just proxy
      * the stream of data we receive from our master instead, in order to
      * propagate *identical* replication stream. In this way this slave can
@@ -226,6 +234,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
      * master replication history and has the same backlog and offsets). */
     if (server.masterhost != NULL) return;
 
+    // step 2: 当前没有slave是无需执行。
     /* If there aren't slaves, and there is no backlog buffer to populate,
      * we can return ASAP. */
     if (server.repl_backlog == NULL && listLength(slaves) == 0) return;
@@ -233,6 +242,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
     /* We can't have slaves attached and no backlog. */
     serverAssert(!(listLength(slaves) != 0 && server.repl_backlog == NULL));
 
+    // step 3: server.slaveseldb 是 写replication stream给slave时最新的db. dictid是argv命令所作用的db。如果不相等，则补充 select 命令。
     /* Send SELECT command to every slave if needed. */
     if (server.slaveseldb != dictid) {
         robj *selectcmd;
@@ -267,6 +277,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
     }
     server.slaveseldb = dictid;
 
+    // step 4: 把argv命令写入 复制积压缓冲区
     /* Write the command to the replication backlog if any. */
     if (server.repl_backlog) {
         char aux[LONG_STR_SIZE+3];
@@ -294,6 +305,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
         }
     }
 
+    // step 5: 把argv命令写入 slave的链接
     /* Write the command to every slave. */
     listRewind(slaves,&li);
     while((ln = listNext(&li))) {
@@ -3393,6 +3405,9 @@ void replicationCron(void) {
             checkClientPauseTimeoutAndReturnIfPaused();
 
         if (!manual_failover_in_progress) {
+            // 定期发送 ping命令 给slave，示活. 
+            // slave如何响应该命令? 不回pong，见prepareClientToWrite函数.
+            // 虽然没有响应，但是会占用 replication offset.
             ping_argv[0] = shared.ping;
             replicationFeedSlaves(server.slaves, server.slaveseldb,
                 ping_argv, 1);

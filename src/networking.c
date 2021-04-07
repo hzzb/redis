@@ -241,6 +241,12 @@ void clientInstallWriteHandler(client *c) {
  * Typically gets called every time a reply is built, before adding more
  * data to the clients output buffers. If the function returns C_ERR no
  * data should be appended to the output buffers. */
+
+// 准备写c的输出缓冲区时时调用, 如addReply函数
+// 返回不是C_OK时，需要放弃写。
+// c->flags 中包含 CLIENT_MASTER CLIENT_SLAVE时 不返回C_OK，表示放弃写
+// 所以master -> slave的ping, 是没有响应的
+// 但slave -> master的 replconf ack 没有响应是由于命令处理函数本身不响应
 int prepareClientToWrite(client *c) {
     /* If it's the Lua client we always return ok without installing any
      * handler since there is no socket at all. */
@@ -252,6 +258,7 @@ int prepareClientToWrite(client *c) {
     /* CLIENT REPLY OFF / SKIP handling: don't send replies. */
     if (c->flags & (CLIENT_REPLY_OFF|CLIENT_REPLY_SKIP)) return C_ERR;
 
+    // c是链接向master的client，且没有 CLIENT_MASTER_FORCE_REPLY 标记，则放弃写。
     /* Masters don't receive replies, unless CLIENT_MASTER_FORCE_REPLY flag
      * is set. */
     if ((c->flags & CLIENT_MASTER) &&
