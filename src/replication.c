@@ -3342,6 +3342,9 @@ void replicationCron(void) {
      * handling the failover. */
     updateFailoverStatus();
 
+    // step 2: 如果不是top level的master则说明是slave.
+    // 建链开始->握手结束 过程中链接连续空闲时间 超过了server.repl_timeout时，则说明有超时。
+    // 关闭旧链接，重新建立链接
     /* Non blocking connection timeout? */
     if (server.masterhost &&
         (server.repl_state == REPL_STATE_CONNECTING ||
@@ -3352,6 +3355,7 @@ void replicationCron(void) {
         cancelReplicationHandshake(1);
     }
 
+    // step 3: 若果在rdb文件传输阶段，空闲时间过长，则取消并重新建链
     /* Bulk transfer I/O timeout? */
     if (server.masterhost && server.repl_state == REPL_STATE_TRANSFER &&
         (time(NULL)-server.repl_transfer_lastio) > server.repl_timeout)
@@ -3360,6 +3364,7 @@ void replicationCron(void) {
         cancelReplicationHandshake(1);
     }
 
+    // step 4: 若果已经链接但是空闲时间长了，没有收到数据也没有收到ping, 则关闭链接
     /* Timed out master when we are an already connected slave? */
     if (server.masterhost && server.repl_state == REPL_STATE_CONNECTED &&
         (time(NULL)-server.master->lastinteraction) > server.repl_timeout)
@@ -3368,6 +3373,7 @@ void replicationCron(void) {
         freeClient(server.master);
     }
 
+    // step 5: 若果需要链接master 则链接master
     /* Check if we should connect to a MASTER */
     if (server.repl_state == REPL_STATE_CONNECT) {
         serverLog(LL_NOTICE,"Connecting to MASTER %s:%d",
@@ -3375,6 +3381,8 @@ void replicationCron(void) {
         connectWithMaster();
     }
 
+    // step 6: 如果server.master已经就绪了，且支持psync, 则定期回复replconf ack offset
+    // 那么server.master什么时候算就绪了呢？一定在握手完成后，rdb结束前吗？
     /* Send ACK to master from time to time.
      * Note that we do not send periodic acks to masters that don't
      * support PSYNC and replication offsets. */
@@ -3390,6 +3398,7 @@ void replicationCron(void) {
     listNode *ln;
     robj *ping_argv[1];
 
+    // step 7: 定期向top level master的直接slave发送ping命令
     /* First, send PING according to ping_slave_period. */
     if ((replication_cron_loops % server.repl_ping_slave_period) == 0 &&
         listLength(server.slaves))
@@ -3414,6 +3423,8 @@ void replicationCron(void) {
         }
     }
 
+    // step 8: 在等待master生成rdb期间，直接在链接上发送一些换行，不计入offset, 多级slave也会发送。
+    // 如此这样的话，slave如何得知自己的offset? 不是读到的字节数吗？ 需要去掉换行的字节占用。
     /* Second, send a newline to all the slaves in pre-synchronization
      * stage, that is, slaves waiting for the master to create the RDB file.
      *
@@ -3438,10 +3449,12 @@ void replicationCron(void) {
              server.rdb_child_type != RDB_CHILD_TYPE_SOCKET));
 
         if (is_presync) {
+            // 直接写链接，不走复制积压缓冲区
             connWrite(slave->conn, "\n", 1);
         }
     }
 
+    // step 9: 断开长期没有replconf ack offset 的slave
     /* Disconnect timedout slaves. */
     if (listLength(server.slaves)) {
         listIter li;
