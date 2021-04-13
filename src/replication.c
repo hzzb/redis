@@ -431,6 +431,7 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
 
 /* Feed the slave 'c' with the replication backlog starting from the
  * specified 'offset' up to the end of the backlog. */
+// 从server.repl_backlog全局复制缓冲区，offset字节处开始到末尾，写到c的output buf
 long long addReplyReplicationBacklog(client *c, long long offset) {
     long long j, skip, len;
 
@@ -614,6 +615,7 @@ int masterTryPartialResynchronization(client *c) {
     /* We can't use the connection buffers since they are used to accumulate
      * new commands at this stage. But we are sure the socket send buffer is
      * empty so this write will never fail actually. */
+    // 直接写fd, 此时output buf也是空的
     if (c->slave_capa & SLAVE_CAPA_PSYNC2) {
         buflen = snprintf(buf,sizeof(buf),"+CONTINUE %s\r\n", server.replid);
     } else {
@@ -623,6 +625,7 @@ int masterTryPartialResynchronization(client *c) {
         freeClientAsync(c);
         return C_OK;
     }
+    // 复制积压缓冲区 [psync_offset, 末尾） 复制到 c的 output buf
     psync_len = addReplyReplicationBacklog(c,psync_offset);
     serverLog(LL_NOTICE,
         "Partial resynchronization request from %s accepted. Sending %lld bytes of backlog starting from offset %lld.",
@@ -633,6 +636,7 @@ int masterTryPartialResynchronization(client *c) {
      * has this state from the previous connection with the master. */
 
     // step 5: server.repl_good_slaves_count的计算
+    // c->replstate 设置为 SLAVE_STATE_ONLINE，所以good slaves数量可能增多
     refreshGoodSlavesCount();
 
     /* Fire the replica change modules event. */
@@ -715,6 +719,7 @@ int startBgsaveForReplication(int mincapa) {
             client *slave = ln->value;
 
             if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_START) {
+                // step 3.1: 子进程启动失败时，slave会退化为普通链接，最终关闭
                 slave->replstate = REPL_STATE_NONE;
                 slave->flags &= ~CLIENT_SLAVE;
                 listDelNode(server.slaves,ln);
@@ -726,7 +731,9 @@ int startBgsaveForReplication(int mincapa) {
         return retval;
     }
 
-    // step 4: disk rdb的，回复+FULLRESYNC
+    // step 4: disk rdb的，回复+FULLRESYNC，
+    // 将slave->replstate设置为WATI_BGSAVE_END, 见replicationSetupSlaveForFullResync
+    // 对于diskless socket的，rdbSaveToSlavesSockets函数内部已经做了这2步骤。
     /* If the target is socket, rdbSaveToSlavesSockets() already setup
      * the slaves for a full resync. Otherwise for disk target do it now.*/
     if (!socket_target) {
@@ -795,7 +802,7 @@ void syncCommand(client *c) {
         return;
     }
 
-    // step 5: sync需要一个干净的reply buffer
+    // step 5: sync/psync要求c的输出缓冲区是空的，即之前产生的所有命令响应都已经写入fd
     /* SYNC can't be issued when the server has pending data to send to
      * the client about already issued commands. We need a fresh reply
      * buffer registering the differences between the BGSAVE and the current
@@ -817,6 +824,7 @@ void syncCommand(client *c) {
      *
      * So the slave knows the new replid and offset to try a PSYNC later
      * if the connection with the master is lost. */
+    // 实际部分同步失败时，并没有回复+FULLRESYNC <replid> <offset>
     if (!strcasecmp(c->argv[0]->ptr,"psync")) {
         // step 6.1: client 主张尝试部分同步
         if (masterTryPartialResynchronization(c) == C_OK) {
@@ -848,6 +856,9 @@ void syncCommand(client *c) {
     server.stat_sync_full++;
 
     // step 7.2: 标记c为slave
+    // 因为此处c->replstate设置了WAIT_BGSAVE_START, 在全量rdb阶段结束前，写入c->buf c->reply的响应保持暂存，不写入fd.
+    // 写响应的调用链路大概是: addReply -> prepareClientToReply -> clientInstallWriteHandler，c没有挂在clients_pending_write上，beforeSleep中也就没写fd
+    // 这就是子进程rdb完成前，父进程虽然定期产生ping命令，但slave侧却收不到的原因，因为，只是先写在了output buf中。
     /* Setup the slave as one waiting for BGSAVE to start. The following code
      * paths will change the state if we handle the slave differently. */
     c->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
@@ -895,8 +906,10 @@ void syncCommand(client *c) {
                 break;
         }
 
-        // 回复 +FULLRESYNC.
+        // 回复 +FULLRESYNC <replid> <offset>
         // 复制slave reply buffer 到 c.  WHY?
+        // 因为slave 在fork进行bgsave时，记录了offset，在rdb全量期间，slave的output buf可能有新内容产生。
+        // c要复用slave的全量rdb，就意味着要使用slave相同的offset，所以其output buf也需要和slave保持一样。
         /* To attach this slave, we check that it has at least all the
          * capabilities of the slave that triggered the current BGSAVE. */
         if (ln && ((c->slave_capa & slave->slave_capa) == slave->slave_capa)) {
@@ -1593,6 +1606,8 @@ void disklessLoadDiscardBackup(dbBackup *buckup, int flag) {
 
 /* Asynchronously read the SYNC payload we receive from a master */
 #define REPL_MAX_WRITTEN_BEFORE_FSYNC (1024*1024*8) /* 8 MB */
+
+// psync 命令回复了+FULLRESYNC时，rdb传送阶段的io处理函数
 void readSyncBulkPayload(connection *conn) {
     char buf[PROTO_IOBUF_LEN];
     ssize_t nread, readlen, nwritten;
@@ -1608,6 +1623,8 @@ void readSyncBulkPayload(connection *conn) {
     static char lastbytes[CONFIG_RUN_ID_SIZE];
     static int usemark = 0;
 
+    // step 1: 读返回的第一行。
+    // 如果master使用的是repl-diskless-sync方式，则是$EOF:<40char> 的形式；否则是bulk string。
     /* If repl_transfer_size == -1 we still have to read the bulk length
      * from the master reply. */
     if (server.repl_transfer_size == -1) {
@@ -1619,17 +1636,20 @@ void readSyncBulkPayload(connection *conn) {
         }
 
         if (buf[0] == '-') {
+            // step 1.1: 返回了错误
             serverLog(LL_WARNING,
                 "MASTER aborted replication with an error: %s",
                 buf+1);
             goto error;
         } else if (buf[0] == '\0') {
+            // step 1.2: 只返回了\n，只示活。master在生成rdb期间，会定期发送\n
             /* At this stage just a newline works as a PING in order to take
              * the connection live. So we refresh our last interaction
              * timestamp. */
             server.repl_transfer_lastio = server.unixtime;
             return;
         } else if (buf[0] != '$') {
+            // step 1.3: 返回格式有问题
             serverLog(LL_WARNING,"Bad protocol from MASTER, the first byte is not '$' (we received '%s'), are you sure the host and port are right?", buf);
             goto error;
         }
@@ -1645,16 +1665,18 @@ void readSyncBulkPayload(connection *conn) {
          * delimiter is long and random enough that the probability of a
          * collision with the actual file content can be ignored. */
         if (strncmp(buf+1,"EOF:",4) == 0 && strlen(buf+5) >= CONFIG_RUN_ID_SIZE) {
+            // step 1.4: repl-diskless-sync 的模式
             usemark = 1;
             memcpy(eofmark,buf+5,CONFIG_RUN_ID_SIZE);
             memset(lastbytes,0,CONFIG_RUN_ID_SIZE);
             /* Set any repl_transfer_size to avoid entering this code path
              * at the next call. */
-            server.repl_transfer_size = 0;
+            server.repl_transfer_size = 0; // 该模式无法预知rdb大小
             serverLog(LL_NOTICE,
                 "MASTER <-> REPLICA sync: receiving streamed RDB from master with EOF %s",
                 use_diskless_load? "to parser":"to disk");
         } else {
+            // step 1.5: 完整文件的模式，预先得知文件大小。
             usemark = 0;
             server.repl_transfer_size = strtol(buf+1,NULL,10);
             serverLog(LL_NOTICE,
@@ -1665,6 +1687,8 @@ void readSyncBulkPayload(connection *conn) {
         return;
     }
 
+    // step 2: 非repl-diskless-load的模式，即master返回的rdb要先落盘，再往内存db里加载。
+    // 注意: 和master是否使用repl_diskless_sync无关。
     if (!use_diskless_load) {
         /* Read the data from the socket, store it to a file and search
          * for the EOF. */
@@ -1755,6 +1779,9 @@ void readSyncBulkPayload(connection *conn) {
          * return ASAP and wait for the handler to be called again. */
         if (!eof_reached) return;
     }
+
+    // 执行到此处时，有2种情况
+    // repl-diskless-load模式 或者 非repl-diskless-load且完整rdb已经读完
 
     /* We reach this point in one of the following cases:
      *
@@ -3383,6 +3410,8 @@ void replicationCron(void) {
 
     // step 6: 如果server.master已经就绪了，且支持psync, 则定期回复replconf ack offset
     // 那么server.master什么时候算就绪了呢？一定在握手完成后，rdb结束前吗？
+    // slave在把rdb接收完，解析加载到内存完后，才会ACK。
+    // 见readSyncBulkPayload最后才调用replicationCreateMasterClient函数创建server.master，server.repl_state设置为REPL_STATE_CONNECTED
     /* Send ACK to master from time to time.
      * Note that we do not send periodic acks to masters that don't
      * support PSYNC and replication offsets. */
@@ -3399,6 +3428,10 @@ void replicationCron(void) {
     robj *ping_argv[1];
 
     // step 7: 定期向top level master的直接slave发送ping命令
+    // 从哪个阶段之后就开始定期ping呢？ rdb结束后吗？
+    // 是响应psync命令后，因为那之后就加入了server.slaves。psync之后就是rdb文件阶段和命令传播阶段
+    // 那么有可能在rdb文件传输阶段收到ping吗？能的话破坏了rdb文件格式不合理。
+    // 如何避免不在rdb文件传输阶段收到ping?
     /* First, send PING according to ping_slave_period. */
     if ((replication_cron_loops % server.repl_ping_slave_period) == 0 &&
         listLength(server.slaves))
@@ -3425,6 +3458,7 @@ void replicationCron(void) {
 
     // step 8: 在等待master生成rdb期间，直接在链接上发送一些换行，不计入offset, 多级slave也会发送。
     // 如此这样的话，slave如何得知自己的offset? 不是读到的字节数吗？ 需要去掉换行的字节占用。
+    // 因为这个换行是在rdb文件开始传送前发送的，还没有开始命令传播，slave不把它计入offset。
     /* Second, send a newline to all the slaves in pre-synchronization
      * stage, that is, slaves waiting for the master to create the RDB file.
      *
@@ -3475,6 +3509,7 @@ void replicationCron(void) {
         }
     }
 
+    // step 10: top level master，如果长期没有slave，则释放server.repl_backlog复制积压缓冲区的内存。
     /* If this is a master without attached slaves and there is a replication
      * backlog active, in order to reclaim memory we can free it after some
      * (configured) time. Note that this cannot be done for slaves: slaves
@@ -3512,6 +3547,7 @@ void replicationCron(void) {
         }
     }
 
+    // step 11: 没有slave, AOF_OFF 时 清除script cache
     /* If AOF is disabled and we no longer have attached slaves, we can
      * free our Replication Script Cache as there is no need to propagate
      * EVALSHA at all. */
@@ -3522,6 +3558,7 @@ void replicationCron(void) {
         replicationScriptCacheFlush();
     }
 
+    // step 12: 如果必要，启动子进程
     replicationStartPendingFork();
 
     /* Remove the RDB file used for replication if Redis is not running

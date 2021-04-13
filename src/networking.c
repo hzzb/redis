@@ -200,6 +200,8 @@ client *createClient(connection *conn) {
  * handleClientsWithPendingWrites() function).
  * If we fail and there is more data to write, compared to what the socket
  * buffers can hold, then we'll really install the handler. */
+// c是普通client，已完成全量rdb传输的slave时，将其挂在server.clients_pending_write上
+// event loop before sleep阶段会把output buf 写入fd。
 void clientInstallWriteHandler(client *c) {
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for slaves, if the slave can actually receive
@@ -244,9 +246,9 @@ void clientInstallWriteHandler(client *c) {
 
 // 准备写c的输出缓冲区时时调用, 如addReply函数
 // 返回不是C_OK时，需要放弃写。
-// c->flags 中包含 CLIENT_MASTER CLIENT_SLAVE时 不返回C_OK，表示放弃写
+// c->flags 中包含 CLIENT_MASTER 不返回C_OK，表示放弃写
 // 所以master -> slave的ping, 是没有响应的
-// 但slave -> master的 replconf ack 没有响应是由于命令处理函数本身不响应
+// 但slave -> master的 replconf ack 没有响应是由于命令处理函数本身不响应。
 int prepareClientToWrite(client *c) {
     /* If it's the Lua client we always return ok without installing any
      * handler since there is no socket at all. */
