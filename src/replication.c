@@ -895,6 +895,8 @@ void syncCommand(client *c) {
         listIter li;
 
         // 寻找第一个可以复用其rdb结果的slave
+        // 如果没找到，则本次psync命令是还没响应的，等到下次启动新的子进程时才会回复+FULLRESYNC <replid> <offset>
+        // 这种情况下，slave在发完psync命令后，在收到该命令响应前就有可能收到 “\n” 空行。
         listRewind(server.slaves,&li);
         while((ln = listNext(&li))) {
             slave = ln->value;
@@ -3457,6 +3459,7 @@ void replicationCron(void) {
     }
 
     // step 8: 在等待master生成rdb期间，直接在链接上发送一些换行，不计入offset, 多级slave也会发送。
+    // 包括psync命令的返回还没有产生之前，比如syncCommand中发现已经有bgsave进程但不能复用，只能等待下次启动新的。
     // 如此这样的话，slave如何得知自己的offset? 不是读到的字节数吗？ 需要去掉换行的字节占用。
     // 因为这个换行是在rdb文件开始传送前发送的，还没有开始命令传播，slave不把它计入offset。
     /* Second, send a newline to all the slaves in pre-synchronization
