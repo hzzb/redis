@@ -101,6 +101,7 @@ int anetCloexec(int fd) {
     int r;
     int flags;
 
+    // 如anetSetBlock中的注释，这里是否可以不用循环
     do {
         r = fcntl(fd, F_GETFD);
     } while (r == -1 && errno == EINTR);
@@ -289,10 +290,13 @@ static int anetTcpGenericConnect(char *err, const char *addr, int port,
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
+    // 做域名查询，一个域名可能查处多个地址
     if ((rv = getaddrinfo(addr,portstr,&hints,&servinfo)) != 0) {
         anetSetError(err, "%s", gai_strerror(rv));
         return ANET_ERR;
     }
+
+    // 依次对多个地址建立链接，直到第一个没出错的，退出循环
     for (p = servinfo; p != NULL; p = p->ai_next) {
         /* Try to create the socket and to connect it.
          * If we fail in the socket() call, or on connect(), we retry with
@@ -311,6 +315,7 @@ static int anetTcpGenericConnect(char *err, const char *addr, int port,
                 goto error;
             }
             for (b = bservinfo; b != NULL; b = b->ai_next) {
+                // 绑定本地地址时，只绑定第一个成功的
                 if (bind(s,b->ai_addr,b->ai_addrlen) != -1) {
                     bound = 1;
                     break;
@@ -351,6 +356,7 @@ end:
     /* Handle best effort binding: if a binding address was used, but it is
      * not possible to create a socket, try again without a binding address. */
     if (s == ANET_ERR && source_addr && (flags & ANET_CONNECT_BE_BINDING)) {
+        // 如果有绑定本地地址，且失败了。再使用不绑定本地地址的方式再试一次
         return anetTcpGenericConnect(err,addr,port,NULL,flags);
     } else {
         return s;
@@ -369,6 +375,7 @@ int anetTcpNonBlockBestEffortBindConnect(char *err, const char *addr, int port,
             ANET_CONNECT_NONBLOCK|ANET_CONNECT_BE_BINDING);
 }
 
+// 相较于 anetTcpGenericConnect 版本，不用做dns查询，不用做本地地址绑定
 int anetUnixGenericConnect(char *err, const char *path, int flags)
 {
     int s;

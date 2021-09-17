@@ -2347,10 +2347,12 @@ extern int ProcessingEventsWhileBlocked;
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    // 1、更新 内存使用峰值
     size_t zmalloc_used = zmalloc_used_memory();
     if (zmalloc_used > server.stat_peak_memory)
         server.stat_peak_memory = zmalloc_used;
 
+    // 2、如果是 processEventsWhileBlocked()函数调用(*EventLoop).ProcessEvents() 进来的，只做尽量少的工作。
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
      * case we keep track of the number of events we are processing, since
@@ -2358,10 +2360,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * events to handle. */
     if (ProcessingEventsWhileBlocked) {
         uint64_t processed = 0;
-        processed += handleClientsWithPendingReadsUsingThreads();
+        processed += handleClientsWithPendingReadsUsingThreads(); // 多线程读并解析命令、主线程执行命令产生响应。
         processed += tlsProcessPendingData();
-        processed += handleClientsWithPendingWrites();
-        processed += freeClientsInAsyncFreeQueue();
+        processed += handleClientsWithPendingWrites(); // 写命令执行产生的响应
+        processed += freeClientsInAsyncFreeQueue(); // 关闭 CLIENT_CLOSE_ASAP
         server.events_processed_while_blocked += processed;
         return;
     }
@@ -2434,9 +2436,11 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     if (server.aof_state == AOF_ON)
         flushAppendOnlyFile(0);
 
+    // 实际write(2), 未写完时安装AE_WRITEABLE
     /* Handle writes with pending output buffers. */
     handleClientsWithPendingWritesUsingThreads();
 
+    //  server.clients_to_close链表上的 client，进行实际关闭
     /* Close clients that need to be closed asynchronous */
     freeClientsInAsyncFreeQueue();
 
@@ -3685,6 +3689,7 @@ void call(client *c, int flags) {
 
     server.fixed_time_expire++;
 
+    // 如果有客户端进行 monitor 命令，将本命令连带参数传送过去
     /* Send the command to clients in MONITOR mode if applicable.
      * Administrative commands are considered too dangerous to be shown. */
     if (listLength(server.monitors) &&

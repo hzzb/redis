@@ -260,6 +260,8 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
     if (conn->state == CONN_STATE_CONNECTING &&
             (mask & AE_WRITABLE) && conn->conn_handler) {
 
+        // connect()调用被epoll返回时有可能是出错的，EPOLLERR/EPOLLHUP 在AE框架中被合并为AE_READBLE | AE_WRITEBLE。
+        // 这里需要通过getsockopt(SO_ERROR) 察看socket中是否有错误。注意errno和选项返回值都要看
         int conn_error = connGetSocketError(conn);
         if (conn_error) {
             conn->last_errno = conn_error;
@@ -268,8 +270,10 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
             conn->state = CONN_STATE_CONNECTED;
         }
 
+        // connect()被epoll唤醒时，是可写状态，如果没有对应handler，删除写事件的监听
         if (!conn->write_handler) aeDeleteFileEvent(server.el,conn->fd,AE_WRITABLE);
 
+        // 回调conn->conn_handler。回调后若选择关闭，则无需继续下面
         if (!callHandler(conn, conn->conn_handler)) return;
         conn->conn_handler = NULL;
     }
@@ -285,6 +289,9 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
      * This is useful when, for instance, we want to do things
      * in the beforeSleep() hook, like fsync'ing a file to disk,
      * before replying to a client. */
+
+    // 当同时有可读可写事件到来时，优先回调读，然后写。
+    // 但有 CONN_FLAG_WRITE_BARRIER 标志时，顺序要颠倒。
     int invert = conn->flags & CONN_FLAG_WRITE_BARRIER;
 
     int call_write = (mask & AE_WRITABLE) && conn->write_handler;
