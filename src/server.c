@@ -2038,13 +2038,17 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(id);
     UNUSED(clientData);
 
+    // 1、如果serverCron正常运行，每次都调用watchdogScheduleSignal(), 会重新设置setitimer定时器的超时时间，避免产生SIGALARM信号
+    //    如果运行的不够快，则没有及时重设定时器，触发信号。信号处理函数中会打印告警日志
     /* Software watchdog: deliver the SIGALRM that will reach the signal
      * handler if we don't return here fast enough. */
     if (server.watchdog_period) watchdogScheduleSignal(server.watchdog_period);
 
+    // 2、获取当前时间，并缓存到全局server中
     /* Update the time cache. */
     updateCachedTime(1);
 
+    // 3、动态调高server.hz。 如果hz过小，则epoll_wait()唤醒间隔变长，同等流量下，一次唤醒需要处理的客户端的数量变多，期望唤醒一次时处理200个左右的客户端。如果超过，就需要更频繁地醒过来。
     server.hz = server.config_hz;
     /* Adapt the server.hz value to the number of configured clients. If we have
      * many clients, we want to call serverCron() with an higher frequency. */
@@ -2060,6 +2064,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         }
     }
 
+    // 4、100ms 统计一下in/out流量、命令数
     run_with_period(100) {
         long long stat_net_input_bytes, stat_net_output_bytes;
         atomicGet(server.stat_net_input_bytes, stat_net_input_bytes);
@@ -2072,6 +2077,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 stat_net_output_bytes);
     }
 
+    // 5、更新 server.lruclock 时间戳
     /* We have just LRU_BITS bits per object for LRU information.
      * So we use an (eventually wrapping) LRU clock.
      *
@@ -2086,8 +2092,10 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     unsigned int lruclock = getLRUClock();
     atomicSet(server.lruclock,lruclock);
 
+    // 6、每个hz 更新内存峰值，每100ms更新rss
     cronUpdateMemoryStats();
 
+    // 7、退出
     /* We received a SIGTERM, shutting down here in a safe way, as it is
      * not ok doing so inside the signal handler. */
     if (server.shutdown_asap) {
@@ -3559,12 +3567,15 @@ struct redisCommand *lookupCommandOrOriginal(sds name) {
  * command execution, for example when serving a blocked client, you
  * want to use propagate().
  */
+// 将命令参数传播到aof和slave
 void propagate(struct redisCommand *cmd, int dbid, robj **argv, int argc,
                int flags)
 {
+    // 1 module中才是0，大部分情况是1
     if (!server.replication_allowed)
         return;
 
+    // 2
     /* Propagate a MULTI request once we encounter the first command which
      * is a write command.
      * This way we'll deliver the MULTI/..../EXEC block as a whole and
@@ -3577,8 +3588,11 @@ void propagate(struct redisCommand *cmd, int dbid, robj **argv, int argc,
      * client pause, otherwise data may be lossed during a failover. */
     serverAssert(!(areClientsPaused() && !server.client_pause_in_transaction));
 
+    // 3 有PROPAGATE_AOF 且 没有关aof，则传播aof
     if (server.aof_state != AOF_OFF && flags & PROPAGATE_AOF)
         feedAppendOnlyFile(cmd,dbid,argv,argc);
+
+    // 4 有PROPAGATE_REPL, 则传播slave
     if (flags & PROPAGATE_REPL)
         replicationFeedSlaves(server.slaves,dbid,argv,argc);
 }
@@ -3680,6 +3694,12 @@ void preventCommandReplication(client *c) {
  * preventCommandReplication(client *c);
  *
  */
+// c中已经有一个解析完备的命令可执行。flags补充行为: 记录slowlog、命令相关统计、传播aof、传播slave。
+
+// CMD_CALL_PROPAGATE_AOF： 1、c.flags有 CLIENT_FORCE_AOF 时，即使c没有对数据集发生修改，也追加命令到aof。
+//                          2、c.flags有 CLIENT_PREVENT_AOF_PROP 时，即使c对数据集发生了修改，也不追加命令到aof。
+// CMD_CALL_PROPAGATE_REPL: 3、c.flags有 CLIENT_FORCE_REPL 时，即使c没有对数据集发生修改，也追加命令到slave.reply。
+//                          4、c.flags有 CLIENT_PREVENT_REPL_PROP 时，即使c对数据集发生了修改，也不追加命令到slave.reply。
 void call(client *c, int flags) {
     long long dirty;
     monotime call_timer;
@@ -3689,7 +3709,7 @@ void call(client *c, int flags) {
 
     server.fixed_time_expire++;
 
-    // 如果有客户端进行 monitor 命令，将本命令连带参数传送过去
+    // 1 如果有客户端进行 monitor 命令，将本命令连带参数传送过去
     /* Send the command to clients in MONITOR mode if applicable.
      * Administrative commands are considered too dangerous to be shown. */
     if (listLength(server.monitors) &&
@@ -3699,12 +3719,14 @@ void call(client *c, int flags) {
         replicationFeedMonitors(c,server.monitors,c->db->id,c->argv,c->argc);
     }
 
+    // 2 清除c.flags上的4个标志位，是否广播到aof和slave由命令本身是否产生修改决定。
     /* Initialization: clear the flags that must be set by the command on
      * demand, and initialize the array for additional commands propagation. */
     c->flags &= ~(CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);
     redisOpArray prev_also_propagate = server.also_propagate;
     redisOpArrayInit(&server.also_propagate);
 
+    // 3 执行命令，记录执行时间，变更量，总错误数
     /* Call the command. */
     dirty = server.dirty;
     prev_err_count = server.stat_total_error_replies;
@@ -3716,6 +3738,7 @@ void call(client *c, int flags) {
     dirty = server.dirty-dirty;
     if (dirty < 0) dirty = 0;
 
+    // 4 记录该命令错误次数
     /* Update failed command calls if required.
      * We leverage a static variable (prev_err_count) to retain
      * the counter across nested function calls and avoid logging
@@ -3724,6 +3747,7 @@ void call(client *c, int flags) {
         real_cmd->failed_calls++;
     }
 
+    // 5 将 CLIENT_CLOSE_AFTER_COMMAND 替换为 CLIENT_CLOSE_AFTER_REPLY
     /* After executing command, we will close the client after writing entire
      * reply if it is set 'CLIENT_CLOSE_AFTER_COMMAND' flag. */
     if (c->flags & CLIENT_CLOSE_AFTER_COMMAND) {
@@ -3731,11 +3755,13 @@ void call(client *c, int flags) {
         c->flags |= CLIENT_CLOSE_AFTER_REPLY;
     }
 
+    // 6 如果在加载rdb阶段，执行其中的lua脚本，则取消 slowlog，统计标记
     /* When EVAL is called loading the AOF we don't want commands called
      * from Lua to go into the slowlog or to populate statistics. */
     if (server.loading && c->flags & CLIENT_LUA)
         flags &= ~(CMD_CALL_SLOWLOG | CMD_CALL_STATS);
 
+    // 7
     /* If the caller is Lua, we want to force the EVAL caller to propagate
      * the script if the command flag or client flag are forcing the
      * propagation. */
@@ -3746,6 +3772,7 @@ void call(client *c, int flags) {
             server.lua_caller->flags |= CLIENT_FORCE_AOF;
     }
 
+    // 8
     /* Some commands may contain sensitive data that should
      * not be available in the slowlog. */
     if ((c->flags & CLIENT_PREVENT_LOGGING) && !(c->flags & CLIENT_BLOCKED)) {
@@ -3753,6 +3780,7 @@ void call(client *c, int flags) {
         flags &= ~CMD_CALL_SLOWLOG;
     }
 
+    // 9 记录慢日志
     /* Log the command into the Slow log if needed, and populate the
      * per-command statistics that we show in INFO commandstats. */
     if (flags & CMD_CALL_SLOWLOG && !(c->cmd->flags & CMD_SKIP_SLOWLOG)) {
@@ -3770,6 +3798,7 @@ void call(client *c, int flags) {
     }
     freeClientOriginalArgv(c);
 
+    // 10 统计该命令的执行次数、总执行耗时
     if (flags & CMD_CALL_STATS) {
         /* use the real command that was executed (cmd and lastamc) may be
          * different, in case of MULTI-EXEC or re-written commands such as
@@ -3778,21 +3807,25 @@ void call(client *c, int flags) {
         real_cmd->calls++;
     }
 
+    // 11 flags有CMD_CALL_PROPAGATE_AOF|CMD_CALL_PROPAGATE_REPL之一，且c.flags没有全部"PREVENT"二者，则说明要传播AOF或SLAVE
     /* Propagate the command into the AOF and replication link */
     if (flags & CMD_CALL_PROPAGATE &&
         (c->flags & CLIENT_PREVENT_PROP) != CLIENT_PREVENT_PROP)
     {
         int propagate_flags = PROPAGATE_NONE;
 
+        // 11.1 数据集发生了变更，默认需要传播AOF和SLAVE
         /* Check if the command operated changes in the data set. If so
          * set for replication / AOF propagation. */
         if (dirty) propagate_flags |= (PROPAGATE_AOF|PROPAGATE_REPL);
 
+        // 11.2 没有数据集变更，但c.flags有FORCE时，也要传播AOF和SLAVE
         /* If the client forced AOF / replication of the command, set
          * the flags regardless of the command effects on the data set. */
         if (c->flags & CLIENT_FORCE_REPL) propagate_flags |= PROPAGATE_REPL;
         if (c->flags & CLIENT_FORCE_AOF) propagate_flags |= PROPAGATE_AOF;
 
+        // 11.3 c.flags有PREVENT，即使有变更量，也不传播AOF和SLAVE。当然flags上没有AOF|REPL时，也不传播。需要清除propagate_flags相应标记
         /* However prevent AOF / replication propagation if the command
          * implementation called preventCommandPropagation() or similar,
          * or if we don't have the call() flags to do so. */
@@ -3803,6 +3836,7 @@ void call(client *c, int flags) {
             !(flags & CMD_CALL_PROPAGATE_AOF))
                 propagate_flags &= ~PROPAGATE_AOF;
 
+        // 11.4 propagate_flags有标，且本命令不是module的命令，则调用propagate函数
         /* Call propagate() only if at least one of AOF / replication
          * propagation is needed. Note that modules commands handle replication
          * in an explicit way, so we never replicate them automatically. */
@@ -3810,6 +3844,7 @@ void call(client *c, int flags) {
             propagate(c->cmd,c->db->id,c->argv,c->argc,propagate_flags);
     }
 
+    // 12 恢复c.flags的4个标志
     /* Restore the old replication flags, since call() can be executed
      * recursively. */
     c->flags &= ~(CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);

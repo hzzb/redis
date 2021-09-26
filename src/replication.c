@@ -208,13 +208,13 @@ int canFeedReplicaReplBuffer(client *replica) {
     return 1;
 }
 
-// 把argv代表的数组的命令 追加到server.repl_backlog复制积压缓冲区，同时写到slave的链接上。
-// 注: 只针对最顶级的master和它的直接slave。
+// 把argv代表的数组的命令 追加到server.repl_backlog复制积压缓冲区，同时写到server.slave的响应缓冲区中c.reply。
+// 注: 只针对最顶级的master和它的直接slave。全同步时若rdb还没有传送，则代表salve的client还没有在server.slave链表上
 //
 // 考虑 多级联 redis的情况:
 // master -> slave1 -> slave2
 //                \ -> slave3
-// slave1 写给 slave2/slave3 的内容 和 从master到slave1的内容完全一样，见replicationFeedSlavesFromMasterStream函数。
+// slave1 写给 slave2/slave3 的内容 和 从master到slave1的内容完全一样，见 replicationFeedSlavesFromMasterStream 函数。
 /* Propagate write commands to slaves, and populate the replication backlog
  * as well. This function is used if the instance is a master: we use
  * the commands received by our clients in order to create the replication
