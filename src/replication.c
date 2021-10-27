@@ -156,26 +156,38 @@ void freeReplicationBacklog(void) {
  * This function also increments the global replication offset stored at
  * server.master_repl_offset, because there is no case where we want to feed
  * the backlog without incrementing the offset. */
+// [ptr, ptr+len) 区间的数据追加到复制积压缓冲区
 void feedReplicationBacklog(void *ptr, size_t len) {
     unsigned char *p = ptr;
 
+    // master_repl_offset 是本节点已经生效的最后一个字节的序号。
     server.master_repl_offset += len;
 
     /* This is a circular buffer, so write as much data we can at every
      * iteration and rewind the "idx" index if we reach the limit. */
     while(len) {
+        // repl_backlog_idx 是环形缓冲区尾部空slot的下标，新数据从该位置开始写入
         size_t thislen = server.repl_backlog_size - server.repl_backlog_idx;
+        // 取最小值，保证不写到数组以外
         if (thislen > len) thislen = len;
+        // 从 repl_backlog+repl_backlog_idx 开始写入thislen字节
         memcpy(server.repl_backlog+server.repl_backlog_idx,p,thislen);
+        // 更新 repl_backlog_idx
         server.repl_backlog_idx += thislen;
         if (server.repl_backlog_idx == server.repl_backlog_size)
             server.repl_backlog_idx = 0;
+        // p后移
         len -= thislen;
         p += thislen;
+        // repl_backlog_histlen 一共向环形缓冲区写入了多少字节
         server.repl_backlog_histlen += thislen;
     }
+    // 因为是环形缓冲区，包含的数据不可能超过repl_backlog_size。
+    // 所以从repl_backlog_idx(不含)向前的repl_backlog_histlen字节是有效的数据
     if (server.repl_backlog_histlen > server.repl_backlog_size)
         server.repl_backlog_histlen = server.repl_backlog_size;
+
+    // 第一个有效字节的编号。[repl_backlog_off, repl_backlog_off + repl_backlog_histlen)是有效的数据范围。
     /* Set the offset of the first byte we have in the backlog. */
     server.repl_backlog_off = server.master_repl_offset -
                               server.repl_backlog_histlen + 1;
@@ -209,7 +221,7 @@ int canFeedReplicaReplBuffer(client *replica) {
 }
 
 // 把argv代表的数组的命令 追加到server.repl_backlog复制积压缓冲区，同时写到server.slave的响应缓冲区中c.reply。
-// 注: 只针对最顶级的master和它的直接slave。全同步时若rdb还没有传送，则代表salve的client还没有在server.slave链表上
+// 注: 只针对最顶级的master和它的直接slave。全同步时即使rdb文件没有传送完，代表从的client也会在server.slaves上，因为在psync命令执行中，若有之前的全同步slave可以复用，则复制slave.reply到client.reply
 //
 // 考虑 多级联 redis的情况:
 // master -> slave1 -> slave2
@@ -305,7 +317,7 @@ void replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc) {
         }
     }
 
-    // step 5: 把argv命令写入 slave的链接
+    // step 5: 把argv命令写入 slave.reply 输出缓冲区
     /* Write the command to every slave. */
     listRewind(slaves,&li);
     while((ln = listNext(&li))) {
@@ -588,10 +600,14 @@ int masterTryPartialResynchronization(client *c) {
     /* We still have the data our slave is asking for? */
     if (!server.repl_backlog ||
         psync_offset < server.repl_backlog_off ||
+        // 这个条件是>，而不是>=。因为[repl_backlog_off, repl_backlog_off + repl_backlog_histlen)是环形缓冲区的有效区间。
+        // psync replid offset 命令中offset参数的含义是指从节点希望从offset编号的位置开始复制，从节点已经应用生效的最后一个字节其实是offset-1。
+        // 因此主节点能够接受的offset参数的最大值是环形缓冲区中最后一个字节的下一个位置，即repl_backlog_off + repl_backlog_histlen。
         psync_offset > (server.repl_backlog_off + server.repl_backlog_histlen))
     {
         serverLog(LL_NOTICE,
             "Unable to partial resync with replica %s for lack of backlog (Replica request was: %lld).", replicationGetSlaveName(c), psync_offset);
+        // 为什么有这 master_repl_offset 的判断呢？
         if (psync_offset > server.master_repl_offset) {
             serverLog(LL_WARNING,
                 "Warning: replica %s tried to PSYNC with an offset that is greater than the master replication offset.", replicationGetSlaveName(c));
@@ -601,8 +617,8 @@ int masterTryPartialResynchronization(client *c) {
 
     // step 4: 可以进行partial sync.
     // 标记该client 为slave
-    // 回复 +CONTINUE server.replid
-    // 回复server.repl_backlog复制积压缓冲区中的内容
+    // 回复 +CONTINUE server.replid, 这里是直接写在c.conn上的，不经过c.reply
+    // 回复server.repl_backlog复制积压缓冲区中的内容， 不是直接c.conn，而是c.reply
     /* If we reached this point, we are able to perform a partial resync:
      * 1) Set client state to make it a slave.
      * 2) Inform the client we can continue with +CONTINUE
@@ -623,7 +639,7 @@ int masterTryPartialResynchronization(client *c) {
     }
     if (connWrite(c->conn,buf,buflen) != buflen) {
         freeClientAsync(c);
-        return C_OK;
+        return C_OK; // 写出错，没有必要继续全同步，返回C_OK
     }
     // 复制积压缓冲区 [psync_offset, 末尾） 复制到 c的 output buf
     psync_len = addReplyReplicationBacklog(c,psync_offset);
@@ -762,7 +778,7 @@ void syncCommand(client *c) {
     /* ignore SYNC if already slave or in monitor mode */
     if (c->flags & CLIENT_SLAVE) return;
 
-    // step 2: psync host port failover 的场景
+    // step 2: psync replid port failover 的场景
     /* Check if this is a failover request to a replica with the same replid and
      * become a master if so. */
     if (c->argc > 3 && !strcasecmp(c->argv[0]->ptr,"psync") && 
@@ -803,6 +819,7 @@ void syncCommand(client *c) {
     }
 
     // step 5: sync/psync要求c的输出缓冲区是空的，即之前产生的所有命令响应都已经写入fd
+    // 这点很重要，因为+CONTINUE、+FULLRESYNC 是直接写在c.conn上的，不经过c.reply输出缓冲区
     /* SYNC can't be issued when the server has pending data to send to
      * the client about already issued commands. We need a fresh reply
      * buffer registering the differences between the BGSAVE and the current
@@ -841,7 +858,7 @@ void syncCommand(client *c) {
             if (master_replid[0] != '?') server.stat_sync_partial_err++;
         }
     } else {
-        // step 6.2: client 主张全同步。则client 不同定期回复 replconf ack
+        // step 6.2: c 使用的是sync，而非psync, 主张全同步，不指望cient会定期回复replconf ack
 
         /* If a slave uses SYNC, we are dealing with an old implementation
          * of the replication protocol (like redis-cli --slave). Flag the client
@@ -2155,6 +2172,7 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
 
         if (server.cached_master) {
             psync_replid = server.cached_master->replid;
+            // offset参数有+1的操作，向主节点发送的是期望从哪个字节开始接收
             snprintf(psync_offset,sizeof(psync_offset),"%lld", server.cached_master->reploff+1);
             serverLog(LL_NOTICE,"Trying a partial resynchronization (request %s:%s).", psync_replid, psync_offset);
         } else {
