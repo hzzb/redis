@@ -74,6 +74,7 @@ static inline int connHasRefs(connection *conn) {
  * 2. Execute the handler (if set).
  * 3. Decrement refs and perform deferred close, if refs==0.
  */
+// 返回0表示conn已被关闭
 static inline int callHandler(connection *conn, ConnectionCallbackFunc handler) {
     connIncrRefs(conn);
     if (handler) handler(conn);

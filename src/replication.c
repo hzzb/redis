@@ -2324,26 +2324,33 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
 
 /* This handler fires when the non blocking connect was able to
  * establish a connection with the master. */
+// 先用作conn->conn_handler，在connect系统调用返回时回调，无论链接建立是否成功。conn->state指示链接是否建立成功。
+// 如果建立链接成功，会用作conn->read_handler, 完成与主节点的握手。
 void syncWithMaster(connection *conn) {
     char tmpfile[256], *err = NULL;
     int dfd = -1, maxtries = 5;
     int psync_result;
 
+    // step 1: 执行SLAVEOF SOME ONE后，在connect失败后成功前又执行了SLAVEOF NO ONE，此时不管建链是否成功，都无需再继续。
     /* If this event fired after the user turned the instance into a master
      * with SLAVEOF NO ONE we must just return ASAP. */
     if (server.repl_state == REPL_STATE_NONE) {
-        connClose(conn);
+        connClose(conn); // 建链成功也需要关闭
         return;
     }
 
+    // step 2: 建链失败，在下一个replicationCron定时函数中会重新建链。
     /* Check for errors in the socket: after a non blocking connect() we
      * may find that the socket is in error state. */
     if (connGetState(conn) != CONN_STATE_CONNECTED) {
         serverLog(LL_WARNING,"Error condition on socket for SYNC: %s",
                 connGetLastError(conn));
-        goto error;
+        goto error; // 不能是return，error标签准备下一次重新建链。
     }
 
+    // step 3: 建链成功，设置conn->read_handler为syncWithMaster
+    //         无conn->write_handler，写是阻塞的。主从握手阶段，写给主节点的数据很少，刚建立的链接，是可写状态。
+    //         即使阻塞写，也有超时时间保证不会阻塞过久 server.repl_syncio_timeout 单位秒
     /* Send a PING to check the master is able to reply without errors. */
     if (server.repl_state == REPL_STATE_CONNECTING) {
         serverLog(LL_NOTICE,"Non blocking connect for SYNC fired the event.");
