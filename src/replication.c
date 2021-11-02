@@ -954,19 +954,20 @@ void syncCommand(client *c) {
          * in order to synchronize. */
         serverLog(LL_NOTICE,"Current BGSAVE has socket target. Waiting for next BGSAVE for SYNC");
 
-    // step 8.3: 没有之前的psync命令在进行
+    // step 8.3: 没有之前的psync命令产生的子进程在进行
     /* CASE 3: There is no BGSAVE is progress. */
     } else {
         if (server.repl_diskless_sync && (c->slave_capa & SLAVE_CAPA_EOF) &&
             server.repl_diskless_sync_delay)
         {
-            // 延时创建diskless socket类型子进程，便于合并多个psync的链接
+            // 如果server侧配置了repl-diskless-sync yes, repl-diskless-sync-deday 大于0, 说明在slave capa允许的前提下，优先使用diskless rdb的方式。
+            // 本c是具有EOF能力的，则延时创建diskless socket类型子进程，便于合并多个slave的全同步
             /* Diskless replication RDB child is created inside
              * replicationCron() since we want to delay its start a
              * few seconds to wait for more slaves to arrive. */
             serverLog(LL_NOTICE,"Delay next BGSAVE for diskless SYNC");
         } else {
-            // 不延时，立即创建。
+            // 本c不满足diskless rdb条件，尝试立即创建子进程。
             /* We don't have a BGSAVE in progress, let's start one. Diskless
              * or disk-based mode is determined by replica's capacity. */
             if (!hasActiveChildProcess()) {
@@ -1254,6 +1255,7 @@ void rdbPipeWriteHandlerConnRemoved(struct connection *conn) {
 
 /* Called in diskless master during transfer of data from the rdb pipe, when
  * the replica becomes writable again. */
+// 主进程将子进程管道收到的rdb写向slave的链接
 void rdbPipeWriteHandler(struct connection *conn) {
     serverAssert(server.rdb_pipe_bufflen>0);
     client *slave = connGetPrivateData(conn);
@@ -1277,20 +1279,28 @@ void rdbPipeWriteHandler(struct connection *conn) {
 }
 
 /* Called in diskless master, when there's data to read from the child's rdb pipe */
+// server.rdb_pipe_read 发生可读事件时回调，diskless socket类型rdb子进程产生rdb，通过管道写向父进程，父进程在管道读端写向若干个slave链接。
+// 父进程只有把本次的读到的rdb写入本批次全部slave后才会进行下一次读。如果有slave没有写完，则安装rdbPipeWriteHandler进行写，同时删除server.rdb_pipe_read的读回调，直到所有slave都写完了再重新装回来。
+// 即使使用了6.x的多线程，该回调也依然在主线程中执行，所以大数据量，多slave的全同步是耗时的。
 void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask) {
     UNUSED(mask);
     UNUSED(clientData);
     UNUSED(eventLoop);
     int i;
+
+    // step 1: 创建读缓冲区，大小同client输入缓冲区的默认值。
     if (!server.rdb_pipe_buff)
         server.rdb_pipe_buff = zmalloc(PROTO_IOBUF_LEN);
-    serverAssert(server.rdb_pipe_numconns_writing==0);
+    serverAssert(server.rdb_pipe_numconns_writing==0); // 执行到本回调时，本批slave中不可能有某个是上次所读还未写完的
 
     while (1) {
+        // step 2: 读管道的读端
         server.rdb_pipe_bufflen = read(fd, server.rdb_pipe_buff, PROTO_IOBUF_LEN);
+
+        // step 2.1: 读出错，关闭本批所有的slave链接, 杀掉rdb子进程。
         if (server.rdb_pipe_bufflen < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return;
+                return; // 管道读段是非阻塞的，是正常情况
             serverLog(LL_WARNING,"Diskless rdb transfer, read error sending DB to replicas: %s", strerror(errno));
             for (i=0; i < server.rdb_pipe_numconns; i++) {
                 connection *conn = server.rdb_pipe_conns[i];
@@ -1304,6 +1314,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
             return;
         }
 
+        // step 2.3: 读完了
         if (server.rdb_pipe_bufflen == 0) {
             /* EOF - write end was closed. */
             int stillUp = 0;
@@ -1319,11 +1330,13 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
             /* Now that the replicas have finished reading, notify the child that it's safe to exit. 
              * When the server detectes the child has exited, it can mark the replica as online, and
              * start streaming the replication buffers. */
+            // 子进程退出前阻塞读在rdb_child_exit_pipe对应的读端上，关闭写端，使得子进程可以退出。子进程退出后在step2.1中清空server.rdb_pipe_conns[i]数组
             close(server.rdb_child_exit_pipe);
             server.rdb_child_exit_pipe = -1;
             return;
         }
 
+        // step 3: 把从管道读的内容写到本批次的slave链接里
         int stillAlive = 0;
         for (i=0; i < server.rdb_pipe_numconns; i++)
         {
@@ -1334,6 +1347,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
 
             client *slave = connGetPrivateData(conn);
             if ((nwritten = connWrite(conn, server.rdb_pipe_buff, server.rdb_pipe_bufflen)) == -1) {
+                // step 3.1: 写失败。若链接失效跳过该slave。若链接还是正常的，则下次继续写， 见step 3.3
                 if (connGetState(conn) != CONN_STATE_CONNECTED) {
                     serverLog(LL_WARNING,"Diskless rdb transfer, write error sending DB to replica: %s",
                         connGetLastError(conn));
@@ -1344,6 +1358,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
                 /* An error and still in connected state, is equivalent to EAGAIN */
                 slave->repldboff = 0;
             } else {
+                // step 3.2: 写成功
                 /* Note: when use diskless replication, 'repldboff' is the offset
                  * of 'rdb_pipe_buff' sent rather than the offset of entire RDB. */
                 slave->repldboff = nwritten;
@@ -1351,6 +1366,7 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
             }
             /* If we were unable to write all the data to one of the replicas,
              * setup write handler (and disable pipe read handler, below) */
+            // 本次读到的rdb没有完全写入该slave，则在slave链接上安装可写事件回调 rdbPipeWriteHandler
             if (nwritten != server.rdb_pipe_bufflen) {
                 server.rdb_pipe_numconns_writing++;
                 connSetWriteHandler(conn, rdbPipeWriteHandler);
@@ -1358,10 +1374,13 @@ void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData,
             stillAlive++;
         }
 
+        // step 4: 没有slave链接了
         if (stillAlive == 0) {
             serverLog(LL_WARNING,"Diskless rdb transfer, last replica dropped, killing fork child.");
             killRDBChild();
         }
+
+        // step 5: 有没写完的slave，则不再对管道读直到写完
         /*  Remove the pipe read handler if at least one write handler was set. */
         if (server.rdb_pipe_numconns_writing || stillAlive == 0) {
             aeDeleteFileEvent(server.el, server.rdb_pipe_read, AE_READABLE);
