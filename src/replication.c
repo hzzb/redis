@@ -1819,8 +1819,8 @@ void readSyncBulkPayload(connection *conn) {
     }
 
     // 执行到此处时，有2种情况
-    // repl-diskless-load模式 或者 非repl-diskless-load且完整rdb已经读完
-
+    // 情况1: repl-diskless-load模式 或者
+    // 情况2: 非repl-diskless-load且完整rdb已经读完
     /* We reach this point in one of the following cases:
      *
      * 1. The replica is using diskless replication, that is, it reads data
@@ -1860,6 +1860,7 @@ void readSyncBulkPayload(connection *conn) {
     serverLog(LL_NOTICE, "MASTER <-> REPLICA sync: Loading DB in memory");
     rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
     if (use_diskless_load) {
+        // 情况1: rdb文件不落盘，直接从socket读并解析到内存
         rio rdb;
         rioInitWithConn(&rdb,conn,server.repl_transfer_size);
 
@@ -1922,6 +1923,7 @@ void readSyncBulkPayload(connection *conn) {
         connNonBlock(conn);
         connRecvTimeout(conn,0);
     } else {
+        // 情况2: rdb文件已经读完并落盘了。
         /* Ensure background save doesn't overwrite synced data */
         if (server.child_type == CHILD_TYPE_RDB) {
             serverLog(LL_NOTICE,
@@ -3148,17 +3150,21 @@ void replicationResurrectCachedMaster(connection *conn) {
 /* This function counts the number of slaves with lag <= min-slaves-max-lag.
  * If the option is active, the server will prevent writes if there are not
  * enough connected slaves with the specified lag (or less). */
+// 刷新有多少个 GOOD 的slave
+// GOOD: slave->replstate是SLAVE_STATE_ONLINE，且lag <= server.repl_min_slaves_max_lag
 void refreshGoodSlavesCount(void) {
     listIter li;
     listNode *ln;
     int good = 0;
 
+    // min-replicas-to-write 和 min-replicas-max-lag 同时设置才生效
     if (!server.repl_min_slaves_to_write ||
         !server.repl_min_slaves_max_lag) return;
 
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
         client *slave = ln->value;
+        // 从节点的replconf ack offset命令会更新slave->repl_ack_time。
         time_t lag = server.unixtime - slave->repl_ack_time;
 
         if (slave->replstate == SLAVE_STATE_ONLINE &&
