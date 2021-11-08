@@ -245,7 +245,8 @@ void clientInstallWriteHandler(client *c) {
  * data to the clients output buffers. If the function returns C_ERR no
  * data should be appended to the output buffers. */
 
-// 准备写c的输出缓冲区时时调用, 如addReply函数
+// 返回C_OK，说明c应该接收数据，调用方应该把数据添加到c的reply输出缓冲区中，否则调用方应该放弃本次数据写入。
+// 准备写c的输出缓冲区时调用, 如addReply函数
 // 返回不是C_OK时，需要放弃写。
 // c->flags 中包含 CLIENT_MASTER 不返回C_OK，表示放弃写
 // 所以master -> slave的ping, 是没有响应的
@@ -1483,6 +1484,8 @@ client *lookupClientByID(uint64_t id) {
  * This function is called by threads, but always with handler_installed
  * set to 0. So when handler_installed is set to 0 the function must be
  * thread safe. */
+// 把c的reply输出缓冲区内容尽量多地写到fd中，返回C_OK说明c还可用，返回C_ERR说明写的的过程中链接上出错了，不再可用，已经标记异步free。
+// handler_installed 表示在c的fd是否已经安装了AE_WRITABLE的处理回调。如果安装了且在c的reply中数据已经都写完，就进行删除。
 int writeToClient(client *c, int handler_installed) {
     /* Update total number of writes on server */
     atomicIncr(server.stat_total_writes_processed, 1);
@@ -3606,6 +3609,7 @@ int handleClientsWithPendingWritesUsingThreads(void) {
      * use I/O threads, but the boring synchronous code. */
     if (server.io_threads_num == 1 || stopThreadedIOIfNeeded()) {
         // 直接单线程写
+        // 写不完的安装AE_WRITABLE事件回调函数 sendReplyToClient
         return handleClientsWithPendingWrites();
     }
 
@@ -3665,7 +3669,7 @@ int handleClientsWithPendingWritesUsingThreads(void) {
         if (pending == 0) break;
     }
 
-    // 8、IO线程写到不能再写的时候，则安装AE_WRITEABLE事件。
+    // 8、IO线程写到不能再写的时候，则安装AE_WRITABLE事件。
     /* Run the list of clients again to install the write handler where
      * needed. */
     listRewind(server.clients_pending_write,&li);

@@ -845,7 +845,8 @@ void syncCommand(client *c) {
     if (!strcasecmp(c->argv[0]->ptr,"psync")) {
         // step 6.1: client 主张尝试部分同步
         if (masterTryPartialResynchronization(c) == C_OK) {
-            // partial resync成功，复制积压缓冲区中的内容已经写到c的reply缓冲区。
+            // partial resync成功，master复制积压缓冲区中的内容已经复制到c的reply缓冲区。
+            // +CONTINUE 的回复是直接写在fd上的，在slave侧不占用offset。
             server.stat_sync_partial_ok++;
             return; /* No full resync needed, return. */
         } else {
@@ -3417,6 +3418,7 @@ long long replicationGetSlaveOffset(void) {
 void replicationCron(void) {
     static long long replication_cron_loops = 0;
 
+    // step 1: 查看是否执行过FAILOVER命令，如果有进行failover操作
     /* Check failover status first, to see if we need to start
      * handling the failover. */
     updateFailoverStatus();
@@ -3424,6 +3426,8 @@ void replicationCron(void) {
     // step 2: 如果不是top level的master则说明是slave.
     // 建链开始->握手结束 过程中链接连续空闲时间 超过了server.repl_timeout时，则说明有超时。
     // 关闭旧链接，重新建立链接
+    // server.repl_transfer_lastio的更新时机: 从建链到握手到rdb接收完毕前，都没有创建master client，
+    // 是直接在链接的文件描述符上进行读写，每当从fd上接收数据时都会更新server.repl_transfer_lastio。
     /* Non blocking connection timeout? */
     if (server.masterhost &&
         (server.repl_state == REPL_STATE_CONNECTING ||
@@ -3444,6 +3448,7 @@ void replicationCron(void) {
     }
 
     // step 4: 若果已经链接但是空闲时间长了，没有收到数据也没有收到ping, 则关闭链接
+    // 因为rdb已经接收完毕，是命令传播阶段，已经创建master client，所以不再使用server.repl_transfer_lastio, 而是server.master->lastinteraction。
     /* Timed out master when we are an already connected slave? */
     if (server.masterhost && server.repl_state == REPL_STATE_CONNECTED &&
         (time(NULL)-server.master->lastinteraction) > server.repl_timeout)
@@ -3471,6 +3476,8 @@ void replicationCron(void) {
         !(server.master->flags & CLIENT_PRE_PSYNC))
         replicationSendAck();
 
+    // 从这里开始往后是master视角，前面都是salve视角应该做的检查或操作。
+
     /* If we have attached slaves, PING them from time to time.
      * So slaves can implement an explicit timeout to masters, and will
      * be able to detect a link disconnection even if the TCP connection
@@ -3479,11 +3486,14 @@ void replicationCron(void) {
     listNode *ln;
     robj *ping_argv[1];
 
-    // step 7: 定期向top level master的直接slave发送ping命令
-    // 从哪个阶段之后就开始定期ping呢？ rdb结束后吗？
-    // 是响应psync命令后，因为那之后就加入了server.slaves。psync之后就是rdb文件阶段和命令传播阶段
-    // 那么有可能在rdb文件传输阶段收到ping吗？能的话破坏了rdb文件格式不合理。
-    // 如何避免不在rdb文件传输阶段收到ping?
+    // step 7: 定期向top level master的直接slave发送ping命令，通过写向slave的reply缓冲区实现
+    // 从哪个阶段之后就开始定期ping呢？这由slave->replstate的状态决定
+    // SLAVE_STATE_WAIT_BGSAVE_START: 生成rdb的子进程还没有启动，生成时是COW的，具有父进程的全数据，所以没必要写reply缓冲区。也就没有发送ping。
+    // SLAVE_STATE_WAIT_BGSAVE_END: 已经启动rdb子进程，此时会追加到reply缓冲区，但是没有写向fd.
+    // SLAVE_STATE_SEND_BULK: 正在传送rdb文件，此时会追加到reply缓冲区，但是没有写向fd.
+    // SLAVE_STATE_ONLINE: 此时rdb文件已经传送完，此时会追加到reply缓冲区，也会写向fd。
+    // 因为在 addReply -> prepareClientToWrite -> clientInstallWriteHandler 调用链中只有SLAVE_STATE_ONLINE的才会加入server.clients_pending_write列表
+    // 从而在beforeSleep函数中真正完成从reply输出缓冲区到socket fd的写。
     /* First, send PING according to ping_slave_period. */
     if ((replication_cron_loops % server.repl_ping_slave_period) == 0 &&
         listLength(server.slaves))

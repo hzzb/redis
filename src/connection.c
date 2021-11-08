@@ -260,7 +260,7 @@ static void connSocketEventHandler(struct aeEventLoop *el, int fd, void *clientD
     if (conn->state == CONN_STATE_CONNECTING &&
             (mask & AE_WRITABLE) && conn->conn_handler) {
 
-        // connect()调用被epoll返回时有可能是出错的，EPOLLERR/EPOLLHUP 在AE框架中被合并为AE_READBLE | AE_WRITEBLE。
+        // connect()调用被epoll返回时有可能是出错的，EPOLLERR/EPOLLHUP 在AE框架中被合并为AE_READBLE | AE_WRITABLE。
         // 这里需要通过getsockopt(SO_ERROR) 察看socket中是否有错误。注意errno和选项返回值都要看
         int conn_error = connGetSocketError(conn);
         if (conn_error) {
