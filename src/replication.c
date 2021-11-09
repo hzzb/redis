@@ -1756,6 +1756,11 @@ void readSyncBulkPayload(connection *conn) {
         int eof_reached = 0;
 
         if (usemark) {
+            // 这里使用的策略是检查当前已经读到到最后几个字节，看是否是EOF的标记。
+            // 按照主从复制协议，RDB后紧紧跟着的是增量命令，$EOF:<40 char><rdb><40 char>命令流
+            // 那么最近一次读的最后内容可能不是那40个char, 可能包含了命令流。如此即使rdb传送完了，从节点也识别不出来。
+            // 因此要求master命令流暂不传输。只有从节点回复了ack后才开始传，见mater对c->repl_put_online_on_ack的赋值。
+            // 因此这种检测方法是有效的。如果不这样做，就需要向前搜索，会更费时。
             /* Update the last bytes array, and check if it matches our
              * delimiter. */
             if (nread >= CONFIG_RUN_ID_SIZE) {
@@ -2020,6 +2025,7 @@ void readSyncBulkPayload(connection *conn) {
     }
 
     /* Send the initial ACK immediately to put this replica in online state. */
+    // 立即向master回复ack, 以便开始接收命令流
     if (usemark) replicationSendAck();
 
     /* Restart the AOF subsystem now that we finished the sync. This
