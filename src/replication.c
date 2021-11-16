@@ -2718,6 +2718,8 @@ void replicationAbortSyncTransfer(void) {
  * the replication state (server.repl_state) set to REPL_STATE_CONNECT.
  *
  * Otherwise zero is returned and no operation is performed at all. */
+// 返回1说明有在进行的(连接握手或者rdb传输还未结束)，取消它并在reconnect==1时重新发起一轮。
+// 返回0说明没有在进行的，不看reconnect。
 int cancelReplicationHandshake(int reconnect) {
     if (server.repl_state == REPL_STATE_TRANSFER) {
         replicationAbortSyncTransfer();
