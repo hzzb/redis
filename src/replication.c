@@ -2258,6 +2258,8 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
              * replid to make sure next PSYNCs will fail. */
             memset(server.master_replid,0,CONFIG_RUN_ID_SIZE+1);
         } else {
+            // 保存+FULLRESYNC返回的id、offset到server.master_replid、server.master_initial_offset。
+            // 后面 replicationCreateMasterClient 创建client时会用作其初始值
             memcpy(server.master_replid, replid, offset-replid-1);
             server.master_replid[CONFIG_RUN_ID_SIZE] = '\0';
             server.master_initial_offset = strtoll(offset,NULL,10);
@@ -2292,17 +2294,21 @@ int slaveTryPartialResynchronization(connection *conn, int read_reply) {
             if (strcmp(new,server.cached_master->replid)) {
                 /* Master ID changed. */
                 serverLog(LL_WARNING,"Master replication ID changed to %s",new);
+                // +CONTINUE 返回了新的ID。slave需要将进行shift操作
+                // 把server.cached_master.replid、server.master_repl_offset 移位到 server.replid2、 server.second_replid_offset
 
                 /* Set the old ID as our ID2, up to the current offset+1. */
                 memcpy(server.replid2,server.cached_master->replid,
                     sizeof(server.replid2));
                 server.second_replid_offset = server.master_repl_offset+1;
 
+                // 新的ID保存在server.replid中
                 /* Update the cached master ID and our own primary ID to the
                  * new one. */
                 memcpy(server.replid,new,sizeof(server.replid));
                 memcpy(server.cached_master->replid,new,sizeof(server.replid));
 
+                // 让从节点进行重连
                 /* Disconnect all the sub-slaves: they need to be notified. */
                 disconnectSlaves();
             }
@@ -2721,15 +2727,15 @@ void replicationAbortSyncTransfer(void) {
 // 返回1说明有在进行的(连接握手或者rdb传输还未结束)，取消它并在reconnect==1时重新发起一轮。
 // 返回0说明没有在进行的，不看reconnect。
 int cancelReplicationHandshake(int reconnect) {
-    if (server.repl_state == REPL_STATE_TRANSFER) {
+    if (server.repl_state == REPL_STATE_TRANSFER) { // rdb传输阶段
         replicationAbortSyncTransfer();
         server.repl_state = REPL_STATE_CONNECT;
-    } else if (server.repl_state == REPL_STATE_CONNECTING ||
-               slaveIsInHandshakeState())
+    } else if (server.repl_state == REPL_STATE_CONNECTING || // 建链接阶段
+               slaveIsInHandshakeState()) // 握手阶段, send ping <-> recv psync reply
     {
         undoConnectWithMaster();
         server.repl_state = REPL_STATE_CONNECT;
-    } else {
+    } else { // 都不是，当前没有在进行的复制动作
         return 0;
     }
 

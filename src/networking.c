@@ -878,13 +878,16 @@ void addReplyHelp(client *c, const char **help) {
     void *blenp = addReplyDeferredLen(c);
     int blen = 0;
 
+    // header
     sdstoupper(cmd);
     addReplyStatusFormat(c,
         "%s <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",cmd);
     sdsfree(cmd);
 
+    // subcommands
     while (help[blen]) addReplyStatus(c,help[blen++]);
 
+    // footer
     addReplyStatus(c,"HELP");
     addReplyStatus(c,"    Prints this help.");
 
