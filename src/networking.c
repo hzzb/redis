@@ -1639,6 +1639,8 @@ int handleClientsWithPendingWrites(void) {
             {
                 ae_barrier = 1;
             }
+            // 问题: 假设安装的 sendReplyToClient 在触发后还是没有写完，且在没写完前来了新命令产生了新响应，新响应也没有写完，会在这里重复安装
+            // 无影响，重复安装只多了一次epoll_ctl(EPOLL_CTL_MOD) 操作。 研究是否可以优化掉？
             if (connSetWriteHandlerWithBarrier(c->conn, sendReplyToClient, ae_barrier) == C_ERR) {
                 freeClientAsync(c); // 安装失败就标记关闭
             }
@@ -1716,15 +1718,20 @@ void unprotectClient(client *c) {
  * have a well formed command. The function also returns C_ERR when there is
  * a protocol error: in such a case the client structure is setup to reply
  * with the error and close the connection. */
+// 解析非RESP格式的协议， PROTO_REQ_INLINE格式协议是空格分开的，可以转义，详见 sdssplitargs函数头注视
+// cmd arg0 arg1\r\n
+// cmd arg0 arg1\n
 int processInlineBuffer(client *c) {
     char *newline;
     int argc, j, linefeed_chars = 1;
     sds *argv, aux;
     size_t querylen;
 
+    // step 1: 从c->qb_pos位置开始向后找到第一个换行符。 换行符可以是\n，或者\r\n, linefeed_chars记录换行符字节数。
     /* Search for end of line */
     newline = strchr(c->querybuf+c->qb_pos,'\n');
 
+    // step 2: 一行的大小不能超过 64KB，否则回复错误信息，关闭连接
     /* Nothing to do without a \r\n */
     if (newline == NULL) {
         if (sdslen(c->querybuf)-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
@@ -1734,27 +1741,31 @@ int processInlineBuffer(client *c) {
         return C_ERR;
     }
 
+    // step 3: newline永远指向换行符的第一个字节，也就是命令参数最后一个字节的后一个位置
     /* Handle the \r\n case. */
     if (newline != c->querybuf+c->qb_pos && *(newline-1) == '\r')
         newline--, linefeed_chars++;
 
+    // step 4: 分割命令和参数，形成sds数组. argv[], argc数组元素个数
     /* Split the input buffer up to the \r\n */
     querylen = newline-(c->querybuf+c->qb_pos);
     aux = sdsnewlen(c->querybuf+c->qb_pos,querylen);
     argv = sdssplitargs(aux,&argc);
     sdsfree(aux);
-    if (argv == NULL) {
+    if (argv == NULL) { // 分割命令出错。
         addReplyError(c,"Protocol error: unbalanced quotes in request");
         setProtocolError("unbalanced quotes in inline request",c);
         return C_ERR;
     }
 
+    // step 5: 空行是合法的。 从节点刷新 c->repl_ack_time 的时间
     /* Newline from slaves can be used to refresh the last ACK time.
      * This is useful for a slave to ping back while loading a big
      * RDB file. */
     if (querylen == 0 && getClientType(c) == CLIENT_TYPE_SLAVE)
         c->repl_ack_time = server.unixtime;
 
+    // step 6: master写给salve的都是RESP协议，不会是INLINE的，除非发送过来的是空行，用作示活
     /* Masters should never send us inline protocol to run actual
      * commands. If this happens, it is likely due to a bug in Redis where
      * we got some desynchronization in the protocol, for example
@@ -1769,9 +1780,11 @@ int processInlineBuffer(client *c) {
         return C_ERR;
     }
 
+    // step 7: 后移动 c->qb_pos
     /* Move querybuffer position to the next query in the buffer. */
     c->qb_pos += querylen+linefeed_chars;
 
+    // step 8: 把分割的命令参数创建成c->argv数组中，用于后续的执行
     /* Setup argv array on client structure */
     if (argc) {
         if (c->argv) zfree(c->argv);
@@ -1786,7 +1799,7 @@ int processInlineBuffer(client *c) {
         c->argv_len_sum += sdslen(argv[j]);
     }
     zfree(argv);
-    return C_OK;
+    return C_OK; //命令解析完成
 }
 
 /* Helper function. Record protocol erro details in server log,
@@ -3730,7 +3743,7 @@ int postponeClientRead(client *c) {
  * the reads in the buffers, and also parse the first command available
  * rendering it in the client structures. */
 int handleClientsWithPendingReadsUsingThreads(void) {
-    // 1、多线程未继续或者不使用多线程、不用继续
+    // 1、多线程未启用或者不使用多线程、不用继续
     if (!server.io_threads_active || !server.io_threads_do_reads) return 0;
     int processed = listLength(server.clients_pending_read);
     if (processed == 0) return 0;
