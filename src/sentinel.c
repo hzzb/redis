@@ -2835,7 +2835,9 @@ void sentinelPublishReplyCallback(redisAsyncContext *c, void *reply, void *privd
  *
  * If the master name specified in the message is not known, the message is
  * discarded. */
+// __sentinel__:hello 频道的message内容是逗号分割的字段，共8段，每段有固定的含义。
 void sentinelProcessHelloMessage(char *hello, int hello_len) {
+    // step 1: 按逗号分隔8个字段。 个人觉得变量token应该叫做fields更合适。
     /* Format is composed of 8 tokens:
      * 0=ip,1=port,2=runid,3=current_epoch,4=master_name,
      * 5=master_ip,6=master_port,7=master_config_epoch. */
@@ -2845,16 +2847,18 @@ void sentinelProcessHelloMessage(char *hello, int hello_len) {
     sentinelRedisInstance *si, *master;
 
     if (numtokens == 8) {
+        // step 2: 如果本sentinel没有监视这个master，则跳过
         /* Obtain a reference to the master this hello message is about */
         master = sentinelGetMasterByName(token[4]);
         if (!master) goto cleanup; /* Unknown master, skip the message. */
 
+        // step 3: 按照ip、port、runid查找master->sentinels是否已经有对应项。 有的话si有值。
         /* First, try to see if we already have this sentinel. */
         port = atoi(token[1]);
         master_port = atoi(token[6]);
         si = getSentinelRedisInstanceByAddrAndRunID(
                         master->sentinels,token[0],port,token[2]);
-        current_epoch = strtoull(token[3],NULL,10);
+        current_epoch = strtoull(token[3],NULL,10); // 消息发出者的epoch
         master_config_epoch = strtoull(token[7],NULL,10);
 
         if (!si) {
@@ -4133,6 +4137,7 @@ seterr:
  *
  * Because we have a Sentinel PUBLISH, the code to send hello messages is the same
  * for all the three kind of instances: masters, slaves, sentinels. */
+// PUBLISH命令 sentinel的处理函数, 频道必须是 __sentinel__:hello
 void sentinelPublishCommand(client *c) {
     if (strcmp(c->argv[1]->ptr,SENTINEL_HELLO_CHANNEL)) {
         addReplyError(c, "Only HELLO messages are accepted by Sentinel instances.");
