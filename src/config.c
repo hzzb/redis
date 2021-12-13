@@ -598,6 +598,11 @@ void loadServerConfigFromString(char *config) {
         } else if (!strcasecmp(argv[0],"loadmodule") && argc >= 2) {
             queueLoadModule(argv[1],&argv[2],argc-2);
         } else if (!strcasecmp(argv[0],"sentinel")) {
+            // sentinel 开头的命令先不生效，加入到三个队列里
+            // preMonitorCfgName数组中的命令加入pre_monitor_cfg队列中
+            // monitor命令加入 monitor_cfg 队列中
+            // 其他命令加入 post_monitor_cfg 队列中
+
             /* argc == 1 is handled by main() as we need to enter the sentinel
              * mode ASAP. */
             if (argc != 1) {
@@ -605,6 +610,8 @@ void loadServerConfigFromString(char *config) {
                     err = "sentinel directive while not in sentinel mode";
                     goto loaderr;
                 }
+                // 分到三个队列暂存。
+                // 最终在loadSentinelConfigFromQueue中应用
                 queueSentinelConfig(argv+1,argc-1,linenum,lines[i]);
             }
         } else {

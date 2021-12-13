@@ -6292,6 +6292,7 @@ int main(int argc, char **argv) {
             exit(1);
         }
         loadServerConfig(server.configfile, config_from_stdin, options);
+        // sentinel在其他所有命令应用完才应用
         if (server.sentinel_mode) loadSentinelConfigFromQueue();
         sdsfree(options);
     }
