@@ -68,8 +68,14 @@ typedef struct sentinelAddr {
 #define SRI_S_DOWN (1<<3)   /* Subjectively down (no quorum). */
 // 客观下线
 #define SRI_O_DOWN (1<<4)   /* Objectively down (confirmed by others). */
+
+// SRI_S_DOWN、SRI_O_DOWN都是标记master.flags的
+// 但SRI_MASTER_DOWN是标记master.sentinels[i].flags的，
+// 指的是监视master的某个sentinel是否认为该master也是SRI_S_DOWN的，见命令is-master-down-by-addr的实现。
 #define SRI_MASTER_DOWN (1<<5) /* A Sentinel with this flag set thinks that
                                    its master is down. */
+
+// 标记master.flags，在failover状态机中。
 #define SRI_FAILOVER_IN_PROGRESS (1<<6) /* Failover is in progress for
                                            this master. */
 #define SRI_PROMOTED (1<<7)            /* Slave selected for promotion. */
@@ -87,6 +93,7 @@ typedef struct sentinelAddr {
 #define SENTINEL_DEFAULT_DOWN_AFTER 30000
 #define SENTINEL_HELLO_CHANNEL "__sentinel__:hello"
 #define SENTINEL_TILT_TRIGGER 2000
+// 进入tilt模式后，平静期的时长。
 #define SENTINEL_TILT_PERIOD (SENTINEL_PING_PERIOD*30)
 #define SENTINEL_DEFAULT_SLAVE_PRIORITY 100
 #define SENTINEL_SLAVE_RECONF_TIMEOUT 10000
@@ -3700,20 +3707,28 @@ NULL
         long port;
         int isdown = 0;
 
+        // step 1: 解析port和current_epoch参数，它们是整数，若失败返回响应。
+        // sentinel在发送该命令时，current-epoch的取值是其sentinel.current_epoch。
         if (c->argc != 6) goto numargserr;
         if (getLongFromObjectOrReply(c,c->argv[3],&port,NULL) != C_OK ||
             getLongLongFromObjectOrReply(c,c->argv[4],&req_epoch,NULL)
                                                               != C_OK)
             return;
+
+        // step 2: 按照ip:port组合寻找对应的主节点对象。
         ri = getSentinelRedisInstanceByAddrAndRunID(sentinel.masters,
             c->argv[2]->ptr,port,NULL);
 
+        // step 3: 本sentinel是否也认为ri处于SRI_S_DOWN主观下线状态
+        // 必须是非tilt模式，因为tilt模式下的结论可信度低。
+        // 对应ri必须是主节点，且已经SRI_S_DOWN主观下线，才会回复isdown=1。
         /* It exists? Is actually a master? Is subjectively down? It's down.
          * Note: if we are in tilt mode we always reply with "0". */
         if (!sentinel.tilt && ri && (ri->flags & SRI_S_DOWN) &&
                                     (ri->flags & SRI_MASTER))
             isdown = 1;
 
+        // step 3: runid参数如果不是*，则说明是failover leader选举拉票。投票leader
         /* Vote for the master (or fetch the previous vote) if the request
          * includes a runid, otherwise the sender is not seeking for a vote. */
         if (ri && ri->flags & SRI_MASTER && strcasecmp(c->argv[5]->ptr,"*")) {
@@ -3724,6 +3739,7 @@ NULL
 
         /* Reply with a three-elements multi-bulk reply:
          * down state, leader, vote epoch. */
+        // step 4: 返回响应
         addReplyArrayLen(c,3);
         addReply(c, isdown ? shared.cone : shared.czero);
         addReplyBulkCString(c, leader ? leader : "*");
@@ -4309,7 +4325,7 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
             ri->flags |= SRI_S_DOWN;
         }
     } else {
-        // 主官是上线状态
+        // 主观是上线状态
         /* Is subjectively up */
         if (ri->flags & SRI_S_DOWN) {
             sentinelEvent(LL_WARNING,"-sdown",ri,"%@");
@@ -4410,6 +4426,7 @@ void sentinelReceiveIsMasterDownReply(redisAsyncContext *c, void *reply, void *p
  * in order to get the replies that allow to reach the quorum
  * needed to mark the master in ODOWN state and trigger a failover. */
 #define SENTINEL_ASK_FORCED (1<<0)
+// 向master的所有哨兵发送 SENTINEL IS-MASTER-DOWN-BY-ADDR 命令
 void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int flags) {
     dictIterator *di;
     dictEntry *de;
@@ -4417,11 +4434,13 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
     di = dictGetIterator(master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
+        // step 1: 距离ri哨兵上一次返回的时间
         mstime_t elapsed = mstime() - ri->last_master_down_reply_time;
         char port[32];
         int retval;
 
         /* If the master state from other sentinel is too old, we clear it. */
+        // step 2: 如果上一次返回的时间已经很久，数据就不可信了，清除其主观下线的标志
         if (elapsed > SENTINEL_ASK_PERIOD*5) {
             ri->flags &= ~SRI_MASTER_DOWN;
             sdsfree(ri->leader);
@@ -4433,6 +4452,10 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
          * 1) We believe it is down, or there is a failover in progress.
          * 2) Sentinel is connected.
          * 3) We did not receive the info within SENTINEL_ASK_PERIOD ms. */
+        // step 3: 是否发送命令的最后判断
+        //         1）本节点视角必须是主观下线
+        //         2）与哨兵的连接没有断开
+        //         3）非强制发送情况下，距离上次命令返回超过了1s
         if ((master->flags & SRI_S_DOWN) == 0) continue;
         if (ri->link->disconnected) continue;
         if (!(flags & SENTINEL_ASK_FORCED) &&
@@ -4440,6 +4463,7 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
             continue;
 
         /* Ask */
+        // step 4: 发送命令，返回由sentinelReceiveIsMasterDownReply函数处理
         ll2string(port,sizeof(port),master->addr->port);
         retval = redisAsyncCommand(ri->link->cc,
                     sentinelReceiveIsMasterDownReply, ri,
@@ -4447,6 +4471,7 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
                     sentinelInstanceMapCommand(ri,"SENTINEL"),
                     announceSentinelAddr(master->addr), port,
                     sentinel.current_epoch,
+                    // failover_state 区分是常规检测，还是拉票检测
                     (master->failover_state > SENTINEL_FAILOVER_STATE_NONE) ?
                     sentinel.myid : "*");
         if (retval == C_OK) ri->link->pending_commands++;
@@ -4469,6 +4494,7 @@ void sentinelSimFailureCrash(void) {
  * If a vote is not available returns NULL, otherwise return the Sentinel
  * runid and populate the leader_epoch with the epoch of the vote. */
 char *sentinelVoteLeader(sentinelRedisInstance *master, uint64_t req_epoch, char *req_runid, uint64_t *leader_epoch) {
+    // step 1: 更新sentinel.current_epoch，始终往更大的方向增长
     if (req_epoch > sentinel.current_epoch) {
         sentinel.current_epoch = req_epoch;
         sentinelFlushConfig();
@@ -4476,6 +4502,7 @@ char *sentinelVoteLeader(sentinelRedisInstance *master, uint64_t req_epoch, char
             (unsigned long long) sentinel.current_epoch);
     }
 
+    // step 2: 如果是更新的一轮任期，则投req_runid一票。保证每一轮任期只投一票
     if (master->leader_epoch < req_epoch && sentinel.current_epoch <= req_epoch)
     {
         sdsfree(master->leader);
@@ -4491,6 +4518,7 @@ char *sentinelVoteLeader(sentinelRedisInstance *master, uint64_t req_epoch, char
             master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC;
     }
 
+    // step 3: 返回master的leader及其任期
     *leader_epoch = master->leader_epoch;
     return master->leader ? sdsnew(master->leader) : NULL;
 }
@@ -4667,15 +4695,24 @@ int sentinelSendSlaveOf(sentinelRedisInstance *ri, const sentinelAddr *addr) {
 }
 
 /* Setup the master state to start a failover. */
+// 使master进入failover状态机
 void sentinelStartFailover(sentinelRedisInstance *master) {
+    // step 1: 必须是master
     serverAssert(master->flags & SRI_MASTER);
 
+    // step 2: failover状态和标志
     master->failover_state = SENTINEL_FAILOVER_STATE_WAIT_START;
     master->flags |= SRI_FAILOVER_IN_PROGRESS;
+
+    // step 3: 递增序号
     master->failover_epoch = ++sentinel.current_epoch;
+
+    // step 4: 发送事件
     sentinelEvent(LL_WARNING,"+new-epoch",master,"%llu",
         (unsigned long long) sentinel.current_epoch);
     sentinelEvent(LL_WARNING,"+try-failover",master,"%@");
+
+    // step 5: 随机一下启动时间，更好地避免多个哨兵对一个master同时进行failover
     master->failover_start_time = mstime()+rand()%SENTINEL_MAX_DESYNC;
     master->failover_state_change_time = mstime();
 }
@@ -4691,17 +4728,22 @@ void sentinelStartFailover(sentinelRedisInstance *master) {
  * start the failover but that we'll not be able to act.
  *
  * Return non-zero if a failover was started. */
+// 检查是否可以启动failover状态机，返回1表示启动了，0不启动。
 int sentinelStartFailoverIfNeeded(sentinelRedisInstance *master) {
     /* We can't failover if the master is not in O_DOWN state. */
+    // step 1: 必须已经是客观下线状态
     if (!(master->flags & SRI_O_DOWN)) return 0;
 
     /* Failover already in progress? */
+    // step 2: 已经在failover过程中了，不必重复启动
     if (master->flags & SRI_FAILOVER_IN_PROGRESS) return 0;
 
     /* Last failover attempt started too little time ago? */
+    // step 3: 距离上一次failover时间不足 2 * failover_timeout时，不启动。避免频繁地failover。
     if (mstime() - master->failover_start_time <
         master->failover_timeout*2)
     {
+        // step 3.1: 输出日志
         if (master->failover_delay_logged != master->failover_start_time) {
             time_t clock = (master->failover_start_time +
                             master->failover_timeout*2) / 1000;
@@ -4717,6 +4759,7 @@ int sentinelStartFailoverIfNeeded(sentinelRedisInstance *master) {
         return 0;
     }
 
+    // step 4: 启动failover状态机
     sentinelStartFailover(master);
     return 1;
 }
@@ -5052,9 +5095,12 @@ void sentinelFailoverSwitchToPromotedSlave(sentinelRedisInstance *master) {
     sentinelResetMasterAndChangeAddress(master,ref->addr->hostname,ref->addr->port);
 }
 
+// 在ri主节点上运行failover状态机。
 void sentinelFailoverStateMachine(sentinelRedisInstance *ri) {
+    // step 1: 必须是主节点
     serverAssert(ri->flags & SRI_MASTER);
 
+    // step 2: 不是在failover阶段的，直接返回
     if (!(ri->flags & SRI_FAILOVER_IN_PROGRESS)) return;
 
     switch(ri->failover_state) {
@@ -5110,7 +5156,7 @@ void sentinelAbortFailover(sentinelRedisInstance *ri) {
 // 1、确保ri->link是正常的，即命令连接和订阅连接都是正常的，不正常的重新建连。
 // 2、发送命令。INFO给Master、Slave，PING/HELLO给Master、Slave、Sentinel。
 // 3、主观下线
-// 4、客户下线
+// 4、客观下线
 void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
     /* ========== MONITORING HALF ============ */
     /* Every kind of instance */
@@ -5120,12 +5166,19 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
     // step 2: 周期性在命令连接发送命令。PING INFO PUBLISH
     sentinelSendPeriodicCommands(ri);
 
+    // 从这里往前都是收集信息的，不进行决策动作。
+    // 往后的是根据收集的历史信息，进行决策动作。
+
     /* ============== ACTING HALF ============= */
     /* We don't proceed with the acting half if we are in TILT mode.
      * TILT happens when we find something odd with the time, like a
      * sudden change in the clock. */
+    // step 2.9: 如果是进入了tilt模式，则从进入开始，往后的30s内都是平静期，不进行决策动作
     if (sentinel.tilt) {
+        // 还在平静期，返回。
         if (mstime()-sentinel.tilt_start_time < SENTINEL_TILT_PERIOD) return;
+
+        // 已过平静期，标记tilt=0, 示意退出tilt模式，可以进行决策动作。
         sentinel.tilt = 0;
         sentinelEvent(LL_WARNING,"-tilt",NULL,"#tilt mode exited");
     }
@@ -5142,12 +5195,21 @@ void sentinelHandleRedisInstance(sentinelRedisInstance *ri) {
     // step 4: 检查主节点，客观下线
     /* Only masters */
     if (ri->flags & SRI_MASTER) {
-        // 对ri标记或者取消SRI_O_DOWN
+        // step 4.1: 对ri标记或者取消SRI_O_DOWN
+        // 计数ri.sentinels中认为ri也是SRI_S_DOWN状态(即ri.sentinels[i].flags有SRI_MASTER_DOWN标记)的个数。
+        // 若超过SENTINEL MONITOR命令中指定的quorum，则把ri.flags标记为SRI_O_DOWN，否则取消该标记。
         sentinelCheckObjectivelyDown(ri);
 
+        // step 4.2 如果检测到客观下线了，开始进入failover状态机
         if (sentinelStartFailoverIfNeeded(ri))
+            // 第一次进入failover状态机，立即向其他哨兵发起leader选举。
+            // 因为主节点ri.failover_state已经被设置成SENTINEL_FAILOVER_STATE_WAIT_START，is-master-down-by-addr命令中runid不再是*，而是myid。
             sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_ASK_FORCED);
+
+        // step 4.3: 运行failover状态机
         sentinelFailoverStateMachine(ri);
+
+        // step 4.4: 定期向ri对应的其他sentinel发送命令，询问在对方视角下，ri主节点是否是主观下线状态，用于step 4.1的客官下线判断
         sentinelAskMasterStateToOtherSentinels(ri,SENTINEL_NO_FLAGS);
     }
 }
@@ -5169,12 +5231,12 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
 
         sentinelHandleRedisInstance(ri);
 
-        // step 1.2: 如果是主节点，递归处理其从节点，或者哨兵节点
+        // step 1.2: 如果是主节点，递归处理其从节点、哨兵节点
         if (ri->flags & SRI_MASTER) {
             sentinelHandleDictOfRedisInstances(ri->slaves);
             sentinelHandleDictOfRedisInstances(ri->sentinels);
 
-            //
+            // step 1.3:
             if (ri->failover_state == SENTINEL_FAILOVER_STATE_UPDATE_CONFIG) {
                 switch_to_promoted = ri;
             }
@@ -5185,7 +5247,7 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
     if (switch_to_promoted)
         sentinelFailoverSwitchToPromotedSlave(switch_to_promoted);
 
-    // step 3: 结束便利字典
+    // step 3: 结束遍历字典
     dictReleaseIterator(di);
 }
 
@@ -5208,37 +5270,49 @@ void sentinelHandleDictOfRedisInstances(dict *instances) {
  * for SENTINEL_TILT_PERIOD to elapse before starting to act again.
  *
  * During TILT time we still collect information, we just do not act. */
+// 检查是否要进入tilt模式。在正常情况下，server.hz为10，即100ms会进行一次时间中断，回调sentinelTimer函数。
+// 如果出现异常情况，比如:
+// 1) 进程被阻塞，因为系统load高、IO阻塞、被信号停止等。
+// 2）系统时钟被修改。
+// 在这两种情况下，时钟是不够稳定的，只进行信息收集，不进行决策动作。
+// 一个tilt模式的平静时间是固定的，一旦进入，需要30s后才能结束。
 void sentinelCheckTiltCondition(void) {
     mstime_t now = mstime();
     mstime_t delta = now - sentinel.previous_time;
 
+    // step 1: 距离上次调用的是间差为负数、或者超过了2s。则说明本该回调的却没有回调，即进入tilt模式。
     if (delta < 0 || delta > SENTINEL_TILT_TRIGGER) {
+        // 标记tilt为1，示意进入tilt模式
         sentinel.tilt = 1;
+        // 记录tilt模式的开始时间
         sentinel.tilt_start_time = mstime();
         sentinelEvent(LL_WARNING,"+tilt",NULL,"#tilt mode entered");
     }
+
+    // step 2: 取当前的ms时间
     sentinel.previous_time = mstime();
 }
 
 // 在serverCron中调用，每秒server.hz次
 void sentinelTimer(void) {
-    // step 1:
+    // step 1: 检查本次回调是否进入tilt模式， 是的话标记sentinel.tilt = 1。
+    // 在tilt模式下，只监视，不动作。
     sentinelCheckTiltCondition();
 
     // step 2: 递归处理若干个sentinelRedisInstance
     sentinelHandleDictOfRedisInstances(sentinel.masters);
 
-    // step 3: fork子进程，执行其他程序； 回收子进程； 杀手超时的子进程
+    // step 3: fork子进程，执行其他程序； 回收子进程； 杀死超时的子进程
     sentinelRunPendingScripts();
     sentinelCollectTerminatedScripts();
     sentinelKillTimedoutScripts();
 
-    // step 4: 随机地改变时钟，使得几个sentinel的时钟不同步，避免同时脑裂。
     /* We continuously change the frequency of the Redis "timer interrupt"
      * in order to desynchronize every Sentinel from every other.
      * This non-determinism avoids that Sentinels started at the same time
      * exactly continue to stay synchronized asking to be voted at the
      * same time again and again (resulting in nobody likely winning the
      * election because of split brain voting). */
+    // step 4: 随机地改变时钟，使得几个sentinel的时钟不同步，避免同时脑裂。
     server.hz = CONFIG_DEFAULT_HZ + rand() % CONFIG_DEFAULT_HZ;
 }
